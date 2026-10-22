@@ -1,0 +1,129 @@
+name: Download and Re-upload Each File as Separate Artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_url:
+        description: 'لینک کامل آرتیفکت (مثلاً .../actions/runs/31523256695/artifacts/9114903400)'
+        required: true
+        type: string
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      file-list: ${{ steps.set-list.outputs.list }}
+    steps:
+      - name: Extract repo and artifact ID from URL
+        id: extract
+        run: |
+          URL="${{ github.event.inputs.artifact_url }}"
+          URL=$(echo "$URL" | xargs) # Trim whitespace
+
+          # استخراج owner/repo از URL
+          REPO=$(echo "$URL" | grep -oE 'github\.com/[^/]+/[^/]+' | sed 's#github\.com/##')
+          # استخراج artifact ID
+          ARTIFACT_ID=$(echo "$URL" | grep -oE 'artifacts/[0-9]+' | grep -oE '[0-9]+')
+
+          if [ -z "$REPO" ] || [ -z "$ARTIFACT_ID" ]; then
+            echo "❌ Could not extract REPO or ARTIFACT_ID from URL: $URL"
+            exit 1
+          fi
+
+          echo "repo=$REPO" >> $GITHUB_OUTPUT
+          echo "artifact_id=$ARTIFACT_ID" >> $GITHUB_OUTPUT
+          echo "DEBUG: repo=$REPO, artifact_id=$ARTIFACT_ID"
+
+      - name: Download artifact using PAT (with redirect fix)
+        env:
+          PAT: ${{ secrets.MY_PAT }}
+          REPO: ${{ steps.extract.outputs.repo }}
+          ARTIFACT_ID: ${{ steps.extract.outputs.artifact_id }}
+        run: |
+          if [ -z "$PAT" ]; then
+            echo "❌ MY_PAT secret is not set."
+            exit 1
+          fi
+
+          API_URL="https://api.github.com/repos/$REPO/actions/artifacts/$ARTIFACT_ID/zip"
+
+          # مرحله ۱: درخواست به API گیت‌هاب و گرفتن آدرس ری‌دایرکت (بدون دنبال کردن خودکار)
+          echo "⏳ Getting redirect URL from GitHub API..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $PAT" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$API_URL")
+
+          if [ "$HTTP_CODE" != "302" ]; then
+            echo "❌ Expected HTTP 302 redirect, got: $HTTP_CODE"
+            # برای دیباگ، خروجی خطا رو نشون بده
+            curl -s -H "Authorization: Bearer $PAT" "$API_URL"
+            exit 1
+          fi
+
+          # گرفتن هدر Location (آدرس نهایی دانلود)
+          REDIRECT_URL=$(curl -s -D - -o /dev/null \
+            -H "Authorization: Bearer $PAT" \
+            "$API_URL" | grep -i '^location:' | sed 's/^[Ll]ocation: //I' | tr -d '\r')
+
+          if [ -z "$REDIRECT_URL" ]; then
+            echo "❌ Failed to get redirect Location header."
+            exit 1
+          fi
+
+          echo "✅ Got signed download URL."
+
+          # مرحله ۲: دانلود از لینک امضاشده بدون هیچ هدر Authorization
+          echo "⏳ Downloading from signed URL (no auth header)..."
+          curl -sL --fail -o artifact.zip "$REDIRECT_URL"
+          echo "✅ Artifact downloaded successfully."
+
+      - name: Extract and generate file list
+        id: set-list
+        run: |
+          mkdir -p extracted
+          unzip -q artifact.zip -d extracted/
+          # استفاده از jq برای ساخت JSON array و خروجی گرفتن
+          FILE_LIST=$(find extracted -type f -printf '%P\n' | jq -R -s -c 'split("\n") | map(select(. != ""))')
+          echo "list=$FILE_LIST" >> $GITHUB_OUTPUT
+          echo "تعداد فایل‌ها: $(echo "$FILE_LIST" | jq 'length')"
+
+      - name: Upload extracted folder as temporary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: extracted-files
+          path: extracted/
+          retention-days: 1 # برای صرفه‌جویی در فضا، یک روز نگه‌داری کن
+
+  upload-each:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # اگه یکی از فایل‌ها خطا داد، بقیه ادامه پیدا کنن
+      matrix:
+        file: ${{ fromJSON(needs.prepare.outputs.file-list) }}
+    steps:
+      - name: Download temporary extracted folder
+        uses: actions/download-artifact@v4
+        with:
+          name: extracted-files
+          path: extracted
+
+      - name: Compute safe and unique artifact name
+        id: safe
+        run: |
+          # ایجاد نام امن از مسیر فایل
+          SAFE=$(echo "${{ matrix.file }}" | tr '/\\:*?"<>| ' '_')
+          # در صورت خالی بودن یا تکراری بودن، از هش استفاده کن
+          if [ -z "$SAFE" ]; then
+            SAFE=$(echo -n "${{ matrix.file }}" | sha256sum | cut -c1-16)
+          fi
+          echo "name=$SAFE" >> $GITHUB_OUTPUT
+
+      - name: Upload single file as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.safe.outputs.name }}
+          path: "extracted/${{ matrix.file }}"
+          if-no-files-found: error
