@@ -65,6 +65,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
+      - uses: actions/checkout@v4
+
       - name: Validate inputs
         shell: bash
         run: |
@@ -82,6 +84,22 @@ jobs:
         with:
           ffmpeg-version: release
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install yt-dlp with impersonation (curl_cffi)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install --upgrade "yt-dlp[default,curl-cffi]"
+          echo "--- نسخه yt-dlp ---"
+          yt-dlp --version
+          echo "--- بررسی curl_cffi ---"
+          python -c "import curl_cffi; print('curl_cffi version:', curl_cffi.__version__)"
+
       - name: Verify FFmpeg codecs
         shell: bash
         run: |
@@ -95,11 +113,13 @@ jobs:
             fi
           done
 
-      - name: Setup yt-dlp
-        uses: AnimMouse/setup-yt-dlp@v3
-        with:
-          ffmpeg: false
-          aria2: true
+      - name: Install aria2
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2
+          aria2c --version | head -n 1
 
       - name: List formats
         if: ${{ github.event.inputs.format_id == '' }}
@@ -107,6 +127,7 @@ jobs:
         run: |
           set -euo pipefail
           yt-dlp -J --no-playlist --no-write-subs --no-write-auto-subs \
+            --extractor-args "generic:impersonate" \
             "${{ github.event.inputs.video_url }}" > info.json
 
           TITLE=$(jq -r '.title // "unknown"' info.json)
@@ -136,6 +157,7 @@ jobs:
             --no-write-subs --no-write-auto-subs --no-write-thumbnail \
             --no-part \
             --retries 3 --fragment-retries 3 --retry-sleep 2 \
+            --extractor-args "generic:impersonate" \
             --merge-output-format mp4 \
             -f "$FORMAT_SPEC" \
             --output "original/%(title).200B.%(ext)s" \
@@ -184,9 +206,8 @@ jobs:
             CRF=$MAX_CRF
           fi
 
-          # انتخاب پسوند خروجی بر اساس کدک صدا
           if [ "$ACODEC" = "libopus" ]; then
-            OUT_EXT="mkv"  # Opus در mp4 غیراستاندارد است
+            OUT_EXT="mkv"
             echo "ℹ️ چون audio_codec=libopus، خروجی .mkv خواهد بود."
           else
             OUT_EXT="mp4"
@@ -204,7 +225,6 @@ jobs:
             "${VPARAMS[@]}" -c:a "$ACODEC" -b:a "$ABITRATE" \
             -movflags +faststart "$OUT_FILE"
 
-          # مقایسه حجم: اگر خروجی بزرگ‌تر شد، نسخه‌ی اصلی را نگه دار
           IN_SIZE=$(stat -c%s "$INPUT")
           OUT_SIZE=$(stat -c%s "$OUT_FILE")
           echo "📊 اصلی: $IN_SIZE بایت | فشرده: $OUT_SIZE بایت"
