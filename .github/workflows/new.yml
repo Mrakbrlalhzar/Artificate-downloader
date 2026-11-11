@@ -68,7 +68,7 @@ jobs:
       - uses: actions/checkout@v4
 
       # ============================================================
-      # بازیابی ابزارهای کش‌شده
+      # بازیابی ابزارهای کش‌شده (بدون نصب مجدد)
       # ============================================================
       - name: Restore cached FFmpeg (with SVT-AV1)
         uses: actions/cache@v4
@@ -120,6 +120,9 @@ jobs:
           fi
           aria2c --version | head -n 1
 
+      # ============================================================
+      # تأیید ابزارها و اعتبارسنجی ورودی‌ها
+      # ============================================================
       - name: Verify tooling
         shell: bash
         run: |
@@ -152,9 +155,9 @@ jobs:
           fi
 
       # ============================================================
-      # لیست فرمت‌ها + HEAD probe برای حجم‌های نامشخص
+      # لیست فرمت‌ها (اگر format_id خالی بود)
       # ============================================================
-      - name: List Formats (parse -F + HEAD probe)
+      - name: List Formats (parse -F output)
         if: ${{ github.event.inputs.format_id == '' }}
         shell: bash
         run: |
@@ -170,6 +173,7 @@ jobs:
             echo "❌ Extraction failed:"
             cat /tmp/formats.err
             echo "### ⚠️ Diagnostic Failed" >> $GITHUB_STEP_SUMMARY
+            echo "Site likely requires **cookies** or is blocking GitHub IP." >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
 
@@ -192,10 +196,12 @@ jobs:
             in_table && NF >= 3 {
               split($1, f1, " ")
               if (f1[1] == "" || f1[1] == "ID") next
+
               format_id  = f1[1]
               ext        = f1[2]
               resolution = f1[3]
               fps        = f1[4]; if (fps == "") fps = "-"
+
               split($2, f2, " ")
               filesize = "?"
               for (i = 1; i in f2; i++) {
@@ -205,63 +211,21 @@ jobs:
                   break
                 }
               }
+
               split($3, f3, " ")
               vcodec_raw = f3[1]
-              split(vcodec_raw, vc, ".")
+              n = split(vcodec_raw, vc, ".")
               vcodec = vc[1]
               if (vcodec == "" || vcodec == "unknown") vcodec = "-"
+
               printf "| %s | %s | %s | %s | %s | %s |\n", format_id, ext, resolution, fps, vcodec, filesize
             }
           ' /tmp/formats.txt >> $GITHUB_STEP_SUMMARY
 
-          # HEAD probe برای فرمت‌هایی که حجم ندارن
-          UNKNOWN_COUNT=$(jq -r '[.formats[] | select(.vcodec != "none" and .vcodec != null) | select(.filesize == null and .filesize_approx == null)] | length' /tmp/info.json 2>/dev/null || echo "0")
-
-          if [ "$UNKNOWN_COUNT" -gt 0 ]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### 🔎 تست حجم با HEAD request" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "| Format ID | Resolution | Size (probed) |" >> $GITHUB_STEP_SUMMARY
-            echo "|-----------|------------|---------------|" >> $GITHUB_STEP_SUMMARY
-
-            jq -r '.formats[] | select(.vcodec != "none" and .vcodec != null) | select(.filesize == null and .filesize_approx == null) | "\(.format_id)|\(.resolution // "-")|\(.url // "")"' /tmp/info.json | while IFS='|' read -r fid res furl; do
-              if [ -z "$furl" ] || [ "$furl" = "null" ]; then
-                echo "| $fid | $res | (no URL) |" >> $GITHUB_STEP_SUMMARY
-                continue
-              fi
-
-              SIZE_BYTES=$(curl -sIL --max-time 20 \
-                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
-                -H "Referer: $URL" \
-                -H "Accept: */*" \
-                "$furl" 2>/dev/null \
-                | grep -i "^content-length:" | tail -1 | awk '{print $2}' | tr -d '\r\n ' || echo "")
-
-              if [ -z "$SIZE_BYTES" ] || [ "$SIZE_BYTES" = "0" ]; then
-                SIZE_BYTES=$(curl -sL --max-time 20 -o /dev/null -D - \
-                  -r 0-0 \
-                  -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                  -H "Referer: $URL" \
-                  "$furl" 2>/dev/null \
-                  | grep -i "^content-range:" | tail -1 | grep -oE '/[0-9]+' | tr -d '/' || echo "")
-              fi
-
-              if [ -n "$SIZE_BYTES" ] && [ "$SIZE_BYTES" -gt 0 ] 2>/dev/null; then
-                SIZE_MB=$(awk -v s="$SIZE_BYTES" 'BEGIN { printf "%.1f", s/1048576 }')
-                echo "| $fid | $res | ${SIZE_MB} MB |" >> $GITHUB_STEP_SUMMARY
-              else
-                echo "| $fid | $res | (unavailable) |" >> $GITHUB_STEP_SUMMARY
-              fi
-            done
-
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "💡 «unavailable» یعنی سایت حتی به HEAD هم حجم نمی‌ده." >> $GITHUB_STEP_SUMMARY
-          fi
-
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "💡 شناسه فرمت را کپی کنید و ورک‌فلو را دوباره با format_id اجرا کنید." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "<details><summary>🔍 خروجی خام -F</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "<details><summary>🔍 خروجی خام -F (برای دیباگ)</summary>" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           cat /tmp/formats.txt >> $GITHUB_STEP_SUMMARY
@@ -269,7 +233,7 @@ jobs:
           echo "</details>" >> $GITHUB_STEP_SUMMARY
 
       # ============================================================
-      # دانلود (FORMAT_SPEC ساده‌شده)
+      # دانلود
       # ============================================================
       - name: Download (with fallback)
         if: ${{ github.event.inputs.format_id != '' }}
@@ -279,8 +243,7 @@ jobs:
           mkdir -p original
           URL="${{ github.event.inputs.video_url }}"
           FORMAT_ID=$(echo "${{ github.event.inputs.format_id }}" | xargs)
-          # فرمت اصلی → اگر نبود، بهترین ویدیو + بهترین صدا → بهترین فایل کامل
-          FORMAT_SPEC="${FORMAT_ID}/bv*+ba/b"
+          FORMAT_SPEC="${FORMAT_ID}+ba/${FORMAT_ID}/bv*+ba/b"
           echo "📥 Format spec: $FORMAT_SPEC"
 
           echo "📥 Method 1: Chrome impersonation..."
@@ -309,7 +272,7 @@ jobs:
           ls -lh original/
 
       # ============================================================
-      # فشرده‌سازی
+      # فشرده‌سازی با FFmpeg
       # ============================================================
       - name: Compress
         if: ${{ github.event.inputs.format_id != '' && github.event.inputs.compress == 'true' }}
@@ -374,6 +337,9 @@ jobs:
           fi
           ls -lh output/
 
+      # ============================================================
+      # کپی نسخه‌ی اصلی (اگر فشرده‌سازی غیرفعال باشد)
+      # ============================================================
       - name: Copy Original (if not compressing)
         if: ${{ github.event.inputs.format_id != '' && github.event.inputs.compress != 'true' }}
         shell: bash
@@ -384,7 +350,7 @@ jobs:
           ls -lh output/
 
       # ============================================================
-      # بسته‌بندی
+      # بسته‌بندی (اختیاری 7z یا مستقیم)
       # ============================================================
       - name: Package
         if: ${{ github.event.inputs.format_id != '' }}
@@ -410,6 +376,9 @@ jobs:
           ls -lh artifact/ >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
+      # ============================================================
+      # آپلود آرتیفکت
+      # ============================================================
       - name: Upload artifact
         if: ${{ github.event.inputs.format_id != '' }}
         uses: actions/upload-artifact@v4
