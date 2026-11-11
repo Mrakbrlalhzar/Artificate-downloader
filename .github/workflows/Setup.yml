@@ -1,0 +1,142 @@
+name: Setup Build Cache (FFmpeg + SVT-AV1 + yt-dlp + aria2)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_version:
+        description: 'نسخه FFmpeg (مثلاً 7.1)'
+        required: true
+        default: '7.1'
+        type: string
+      svt_av1_version:
+        description: 'نسخه SVT-AV1 (مثلاً 3.0.2)'
+        required: true
+        default: '3.0.2'
+        type: string
+      yt_dlp_version:
+        description: 'نسخه yt-dlp (مثلاً 2026.10.26)'
+        required: true
+        default: '2026.10.26'
+        type: string
+      curl_cffi_version:
+        description: 'نسخه curl_cffi (مثلاً 0.15.0)'
+        required: true
+        default: '0.15.0'
+        type: string
+
+jobs:
+  build-ffmpeg:
+    name: Build FFmpeg with libsvtav1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Cache FFmpeg static binary
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: ./ffmpeg-static
+          key: ffmpeg-${{ inputs.ffmpeg_version }}-svtav1-${{ inputs.svt_av1_version }}-${{ runner.os }}
+
+      - name: Install build dependencies
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            autoconf automake build-essential cmake git-core libass-dev \
+            libfreetype6-dev libsdl2-dev libtool libva-dev libvdpau-dev \
+            libvorbis-dev libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev \
+            pkg-config texinfo wget zlib1g-dev nasm yasm
+
+      - name: Build and install SVT-AV1
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --branch v${{ inputs.svt_av1_version }} \
+            https://github.com/OpenVisualCloud/SVT-AV1.git
+          cd SVT-AV1
+          mkdir -p Build && cd Build
+          cmake .. -G"Unix Makefiles" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+          make -j$(nproc)
+          sudo make install
+          echo "SVT-AV1 v${{ inputs.svt_av1_version }} installed."
+
+      - name: Build FFmpeg with libsvtav1
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --branch n${{ inputs.ffmpeg_version }} \
+            https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          cd ffmpeg-src
+          export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}"
+          export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          ./configure \
+            --prefix=/usr/local \
+            --enable-gpl \
+            --enable-libsvtav1 \
+            --enable-libx264 \
+            --enable-libx265 \
+            --enable-libopus \
+            --enable-static \
+            --disable-shared \
+            --disable-doc
+          make -j$(nproc)
+          make install
+          echo "FFmpeg n${{ inputs.ffmpeg_version }} with libsvtav1 built."
+
+      - name: Package static FFmpeg
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ffmpeg-static/bin
+          cp /usr/local/bin/ffmpeg ffmpeg-static/bin/
+          cp /usr/local/bin/ffprobe ffmpeg-static/bin/ 2>/dev/null || true
+          # اطمینان از استاتیک بودن
+          ldd ffmpeg-static/bin/ffmpeg || true
+          echo "FFmpeg packaged in ffmpeg-static/bin/"
+
+  cache-pip-aria2:
+    name: Cache yt-dlp + curl_cffi + aria2
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ inputs.yt_dlp_version }}-curl-cffi-${{ inputs.curl_cffi_version }}-${{ runner.os }}
+
+      - name: Cache Python site-packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/lib/python3.12/site-packages
+            ~/.local/bin
+          key: pysite-${{ inputs.yt_dlp_version }}-${{ inputs.curl_cffi_version }}-${{ runner.os }}
+
+      - name: Install yt-dlp and curl_cffi
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir \
+            "yt-dlp==${{ inputs.yt_dlp_version }}" \
+            "curl_cffi==${{ inputs.curl_cffi_version }}"
+          echo "Installed: yt-dlp $(yt-dlp --version)"
+
+      - name: Cache aria2 binary
+        uses: actions/cache@v4
+        with:
+          path: /usr/bin/aria2c
+          key: aria2-${{ runner.os }}-v1.37.0
+
+      - name: Install aria2 (if not cached)
+        run: |
+          if [ ! -f /usr/bin/aria2c ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq aria2
+          fi
+          aria2c --version | head -n 1
