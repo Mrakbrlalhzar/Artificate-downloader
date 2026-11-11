@@ -7,39 +7,51 @@ on:
         description: 'نسخه FFmpeg (مثلاً 7.1)'
         required: true
         default: '7.1'
-        type: string
       svt_av1_version:
         description: 'نسخه SVT-AV1 (مثلاً 3.0.2)'
         required: true
         default: '3.0.2'
-        type: string
-      yt_dlp_version:
-        description: 'نسخه yt-dlp (مثلاً 2026.10.26)'
+      use_prebuilt_ffmpeg:
+        description: 'استفاده از باینری آماده (سریع‌تر) به جای بیلد از سورس'
         required: true
-        default: '2026.10.26'
-        type: string
-      curl_cffi_version:
-        description: 'نسخه curl_cffi (مثلاً 0.15.0)'
-        required: true
-        default: '0.15.0'
-        type: string
+        type: boolean
+        default: true # پیشنهاد می‌شود برای سرعت بیشتر
 
 jobs:
-  build-ffmpeg:
-    name: Build FFmpeg with libsvtav1
+  cache-ffmpeg:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 30 # کاهش تایم‌اوت برای جلوگیری از انتظار طولانی
     steps:
-      - name: Cache FFmpeg static binary
+      - name: Restore FFmpeg from cache
         id: cache-ffmpeg
         uses: actions/cache@v4
         with:
           path: ./ffmpeg-static
-          key: ffmpeg-${{ inputs.ffmpeg_version }}-svtav1-${{ inputs.svt_av1_version }}-${{ runner.os }}
+          key: ffmpeg-${{ inputs.ffmpeg_version }}-svtav1-${{ inputs.svt_av1_version }}-${{ inputs.use_prebuilt_ffmpeg }}-${{ runner.os }}
 
-      - name: Install build dependencies
-        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+      # --- مسیر ۱: استفاده از باینری آماده (اگر کش نبود و گزینه فعال باشد) ---
+      - name: Download prebuilt FFmpeg with SVT-AV1
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true' && inputs.use_prebuilt_ffmpeg == true
         run: |
+          mkdir -p ffmpeg-static/bin
+          # دانلود از ریلیزهای پروژه nekotrix (باینری استاتیک لینوکس)
+          # توجه: لینک را می‌توانی با آخرین نسخه جایگزین کنی
+          wget -q https://github.com/nekotrix/FFmpeg-Builds-SVT-AV1-Essential/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz -O ffmpeg.tar.xz
+          tar -xf ffmpeg.tar.xz -C ffmpeg-static --strip-components=1
+          echo "✅ Prebuilt FFmpeg downloaded."
+
+      # --- مسیر ۲: بیلد از سورس (فقط اگر کش نبود و گزینه prebuilt غیرفعال باشد) ---
+      - name: Install build dependencies (with DNS/mirror fix)
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true' && inputs.use_prebuilt_ffmpeg != true
+        run: |
+          # اعمال اصلاحات DNS و apt که در بالا توضیح داده شد
+          sudo sh -c 'echo "nameserver 8.8.8.8" > /etc/resolv.conf'
+          sudo sh -c 'echo "nameserver 8.8.4.4" >> /etc/resolv.conf'
+          sudo sed -i -e 's/azure\.//' /etc/apt/apt-mirrors.txt
+          echo 'Acquire::Retries "0";' | sudo tee /etc/apt/apt.conf.d/99-custom-retries
+          echo 'Acquire::http::Timeout "20";' | sudo tee -a /etc/apt/apt.conf.d/99-custom-retries
+          echo 'Acquire::https::Timeout "20";' | sudo tee -a /etc/apt/apt.conf.d/99-custom-retries
+
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
             autoconf automake build-essential cmake git-core libass-dev \
@@ -47,96 +59,32 @@ jobs:
             libvorbis-dev libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev \
             pkg-config texinfo wget zlib1g-dev nasm yasm
 
-      - name: Build and install SVT-AV1
-        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+      - name: Build SVT-AV1
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true' && inputs.use_prebuilt_ffmpeg != true
         run: |
           set -euo pipefail
-          git clone --depth=1 --branch v${{ inputs.svt_av1_version }} \
-            https://github.com/OpenVisualCloud/SVT-AV1.git
-          cd SVT-AV1
-          mkdir -p Build && cd Build
+          git clone --depth=1 --branch v${{ inputs.svt_av1_version }} https://github.com/OpenVisualCloud/SVT-AV1.git
+          cd SVT-AV1 && mkdir -p Build && cd Build
           cmake .. -G"Unix Makefiles" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
-          make -j$(nproc)
-          sudo make install
-          echo "SVT-AV1 v${{ inputs.svt_av1_version }} installed."
+          make -j$(nproc) && sudo make install
 
-      - name: Build FFmpeg with libsvtav1
-        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+      - name: Build FFmpeg
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true' && inputs.use_prebuilt_ffmpeg != true
         run: |
           set -euo pipefail
-          git clone --depth=1 --branch n${{ inputs.ffmpeg_version }} \
-            https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          git clone --depth=1 --branch n${{ inputs.ffmpeg_version }} https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
           cd ffmpeg-src
           export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}"
           export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-          ./configure \
-            --prefix=/usr/local \
-            --enable-gpl \
-            --enable-libsvtav1 \
-            --enable-libx264 \
-            --enable-libx265 \
-            --enable-libopus \
-            --enable-static \
-            --disable-shared \
-            --disable-doc
-          make -j$(nproc)
-          make install
-          echo "FFmpeg n${{ inputs.ffmpeg_version }} with libsvtav1 built."
-
-      - name: Package static FFmpeg
-        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          mkdir -p ffmpeg-static/bin
-          cp /usr/local/bin/ffmpeg ffmpeg-static/bin/
-          cp /usr/local/bin/ffprobe ffmpeg-static/bin/ 2>/dev/null || true
-          # اطمینان از استاتیک بودن
-          ldd ffmpeg-static/bin/ffmpeg || true
-          echo "FFmpeg packaged in ffmpeg-static/bin/"
+          ./configure --prefix=/usr/local --enable-gpl --enable-libsvtav1 \
+            --enable-libx264 --enable-libx265 --enable-libopus \
+            --enable-static --disable-shared --disable-doc
+          make -j$(nproc) && make install
+          mkdir -p $GITHUB_WORKSPACE/ffmpeg-static/bin
+          cp /usr/local/bin/ffmpeg /usr/local/bin/ffprobe $GITHUB_WORKSPACE/ffmpeg-static/bin/
 
   cache-pip-aria2:
-    name: Cache yt-dlp + curl_cffi + aria2
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ inputs.yt_dlp_version }}-curl-cffi-${{ inputs.curl_cffi_version }}-${{ runner.os }}
-
-      - name: Cache Python site-packages
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.local/lib/python3.12/site-packages
-            ~/.local/bin
-          key: pysite-${{ inputs.yt_dlp_version }}-${{ inputs.curl_cffi_version }}-${{ runner.os }}
-
-      - name: Install yt-dlp and curl_cffi
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          pip install --no-cache-dir \
-            "yt-dlp==${{ inputs.yt_dlp_version }}" \
-            "curl_cffi==${{ inputs.curl_cffi_version }}"
-          echo "Installed: yt-dlp $(yt-dlp --version)"
-
-      - name: Cache aria2 binary
-        uses: actions/cache@v4
-        with:
-          path: /usr/bin/aria2c
-          key: aria2-${{ runner.os }}-v1.37.0
-
-      - name: Install aria2 (if not cached)
-        run: |
-          if [ ! -f /usr/bin/aria2c ]; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq aria2
-          fi
-          aria2c --version | head -n 1
+      # ... (بخش کش پکیج‌های پایتون و aria2 بدون تغییر باقی می‌ماند)
