@@ -97,7 +97,6 @@ jobs:
           pip install --upgrade yt-dlp
           pip install "curl_cffi>=0.10,<0.16"
           yt-dlp --version
-          yt-dlp --list-impersonate-targets || true
 
       - name: Verify FFmpeg codecs
         shell: bash
@@ -119,74 +118,87 @@ jobs:
           sudo apt-get install -y -qq aria2
           aria2c --version | head -n 1
 
-      - name: List Formats (using --print for accurate HLS size)
+      - name: List Formats (parse -F output)
         if: ${{ github.event.inputs.format_id == '' }}
         shell: bash
         run: |
           set -euo pipefail
           URL="${{ github.event.inputs.video_url }}"
-          echo "🔍 Fetching format info with filesize approximation via --print..."
+          echo "🔍 Fetching format table via -F..."
 
-          # استفاده از --print به جای -J: چون --print از مسیر format selection
-          # رد می‌شود و مقدار filesize_approx محاسبه‌شده را برمی‌گرداند
-          if ! yt-dlp --skip-download --no-warnings \
+          # گرفتن جدول کامل فرمت‌ها با حجم تخمینی
+          if ! yt-dlp -F \
             --impersonate "chrome" \
             --extractor-retries 3 \
             --compat-option manifest-filesize-approx \
-            --print "TITLE|%(title)s" \
-            --print "DURATION|%(duration)s" \
-            --print "FMT|%(format_id)s|%(ext)s|%(resolution)s|%(vcodec)s|%(filesize_approx)s|%(filesize)s" \
-            "$URL" > /tmp/all.txt 2>err.log; then
+            "$URL" > /tmp/formats.txt 2>/tmp/formats.err; then
             echo "❌ Extraction failed:"
-            cat err.log
+            cat /tmp/formats.err
             echo "### ⚠️ Diagnostic Failed" >> $GITHUB_STEP_SUMMARY
             echo "Site likely requires **cookies** or is blocking GitHub IP." >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
 
-          echo "--- Raw output (debug) ---"
-          head -20 /tmp/all.txt
+          # گرفتن عنوان و مدت با -J (سریع، بدون دانلود)
+          yt-dlp -J --no-warnings \
+            --impersonate "chrome" \
+            --extractor-retries 3 \
+            "$URL" > /tmp/info.json 2>/dev/null || echo '{}' > /tmp/info.json
 
-          # استخراج عنوان و مدت
-          TITLE=$(grep -m1 '^TITLE|' /tmp/all.txt | sed 's/^TITLE|//' || true)
-          DURATION=$(grep -m1 '^DURATION|' /tmp/all.txt | sed 's/^DURATION|//' || true)
-          [ -z "$TITLE" ] && TITLE="(unknown)"
-          [ -z "$DURATION" ] && DURATION="?"
+          TITLE=$(jq -r '.title // "(unknown)"' /tmp/info.json 2>/dev/null || echo "(unknown)")
+          DURATION=$(jq -r '.duration // "?"' /tmp/info.json 2>/dev/null || echo "?")
 
           echo "## 📋 $TITLE" >> $GITHUB_STEP_SUMMARY
           echo "**مدت:** ${DURATION}s" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Format ID | Ext | Resolution | VCodec | Size (MB) |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|-----|------------|--------|-----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Format ID | Ext | Resolution | FPS | VCodec | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-----|------------|-----|--------|------|" >> $GITHUB_STEP_SUMMARY
 
-          while IFS='|' read -r TAG FID EXT RES VC FS_A FS_E; do
-            [ "$TAG" != "FMT" ] && continue
-            [ -z "$FID" ] && continue
-            [ "$VC" = "none" ] && continue
+          # پارس جدول -F با awk (پایدار و مقاوم به تغییرات جزئی)
+          awk -F'[|]' '
+            /^---/ { in_table=1; next }
+            in_table && NF >= 3 {
+              split($1, f1, " ")
+              if (f1[1] == "" || f1[1] == "ID") next
 
-            # اولویت با filesize_approx (دقیق‌تر برای HLS)
-            SIZE="$FS_A"
-            if [ -z "$SIZE" ] || [ "$SIZE" = "None" ] || [ "$SIZE" = "NA" ] || [ "$SIZE" = "null" ]; then
-              SIZE="$FS_E"
-            fi
+              format_id  = f1[1]
+              ext        = f1[2]
+              resolution = f1[3]
+              fps        = f1[4]; if (fps == "") fps = "-"
 
-            if [ -z "$SIZE" ] || [ "$SIZE" = "None" ] || [ "$SIZE" = "NA" ] || [ "$SIZE" = "null" ]; then
-              MB="?"
-            else
-              MB=$(awk -v s="$SIZE" 'BEGIN { printf "%.1f", s/1048576 }')
-            fi
+              split($2, f2, " ")
+              filesize = "?"
+              for (i = 1; i in f2; i++) {
+                if (f2[i] ~ /MiB|GiB|KiB/) {
+                  filesize = f2[i]
+                  if (i > 1 && f2[i-1] == "≈") filesize = "≈" filesize
+                  break
+                }
+              }
 
-            VC_CLEAN="${VC%%.*}"
-            if [ -z "$VC_CLEAN" ] || [ "$VC_CLEAN" = "None" ]; then VC_CLEAN="-"; fi
-            if [ -z "$RES" ] || [ "$RES" = "None" ]; then RES="-"; fi
+              split($3, f3, " ")
+              vcodec_raw = f3[1]
+              n = split(vcodec_raw, vc, ".")
+              vcodec = vc[1]
+              if (vcodec == "" || vcodec == "unknown") vcodec = "-"
 
-            echo "| $FID | $EXT | $RES | $VC_CLEAN | $MB |" >> $GITHUB_STEP_SUMMARY
-          done < /tmp/all.txt
+              printf "| %s | %s | %s | %s | %s | %s |\n", format_id, ext, resolution, fps, vcodec, filesize
+            }
+          ' /tmp/formats.txt >> $GITHUB_STEP_SUMMARY
 
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "💡 شناسه فرمت را کپی کنید و ورک‌فلو را دوباره با format_id اجرا کنید." >> $GITHUB_STEP_SUMMARY
 
-      - name: Download (with fallback methods)
+          # نمایش خروجی خام -F برای دیباگ (قابل باز و بسته شدن)
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "<details><summary>🔍 خروجی خام -F (برای دیباگ)</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/formats.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+
+      - name: Download (with fallback)
         if: ${{ github.event.inputs.format_id != '' }}
         shell: bash
         run: |
@@ -220,8 +232,6 @@ jobs:
               --output "original/%(title).200B.%(ext)s" \
               "$URL"
           fi
-
-          echo "--- Downloaded Files ---"
           ls -lh original/
 
       - name: Compress
@@ -250,7 +260,6 @@ jobs:
           esac
 
           if [ "${{ github.event.inputs.aggressive_compression }}" = "true" ]; then
-            echo "⚡ حالت تهاجمی فعال"
             CRF=$((CRF + 6))
             case "$VCODEC" in
               libx264|libx265) PRESET="veryslow" ;;
@@ -258,17 +267,9 @@ jobs:
             esac
             ABITRATE="96k"
           fi
+          [ "$CRF" -gt "$MAX_CRF" ] && CRF=$MAX_CRF
 
-          if [ "$CRF" -gt "$MAX_CRF" ]; then
-            echo "⚠️ CRF=$CRF > max=$MAX_CRF → محدود شد"
-            CRF=$MAX_CRF
-          fi
-
-          if [ "$ACODEC" = "libopus" ]; then
-            OUT_EXT="mkv"
-          else
-            OUT_EXT="mp4"
-          fi
+          if [ "$ACODEC" = "libopus" ]; then OUT_EXT="mkv"; else OUT_EXT="mp4"; fi
           OUT_FILE="output/${BASENAME}_optimized.${OUT_EXT}"
 
           VPARAMS=(-c:v "$VCODEC")
@@ -277,15 +278,13 @@ jobs:
             libsvtav1) VPARAMS+=(-preset "$SVT_PRESET" -crf "$CRF") ;;
           esac
 
-          echo "🎬 ffmpeg ${VPARAMS[*]} -c:a $ACODEC -b:a $ABITRATE"
           ffmpeg -y -hide_banner -loglevel warning -i "$INPUT" \
             "${VPARAMS[@]}" -c:a "$ACODEC" -b:a "$ABITRATE" \
             -movflags +faststart "$OUT_FILE"
 
           IN_SIZE=$(stat -c%s "$INPUT"); OUT_SIZE=$(stat -c%s "$OUT_FILE")
-          echo "📊 اصلی: $IN_SIZE بایت | فشرده: $OUT_SIZE بایت"
+          echo "📊 اصلی: $IN_SIZE | فشرده: $OUT_SIZE"
           if [ "$OUT_SIZE" -ge "$IN_SIZE" ]; then
-            echo "⚠️ فشرده‌سازی حجم را کم نکرد؛ نسخه‌ی اصلی حفظ می‌شود."
             cp "$INPUT" "output/$(basename "$INPUT")"
             rm -f "$OUT_FILE"
           fi
@@ -307,21 +306,13 @@ jobs:
           set -euo pipefail
           mkdir -p artifact
           [ -z "$(ls -A output)" ] && { echo "❌ پوشه output خالی است"; exit 1; }
-
           if [ "${{ github.event.inputs.package_as_7z }}" = "true" ]; then
             command -v 7z &>/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full; }
-            echo "📦 بسته‌بندی با 7z..."
             7z a -t7z -mx=9 -mfb=273 -ms=on artifact/video.7z output/*
           else
             find output -maxdepth 1 -type f -exec cp {} artifact/ \;
           fi
-          ls -lh artifact/
-
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📊 فایل نهایی" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
           ls -lh artifact/ >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Upload artifact
         if: ${{ github.event.inputs.format_id != '' }}
