@@ -122,15 +122,16 @@ jobs:
           sudo apt-get install -y -qq aria2
           aria2c --version | head -n 1
 
-      - name: List Formats (Attempt with impersonation)
+      - name: List Formats (with filesize approximation for HLS)
         if: ${{ github.event.inputs.format_id == '' }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "🔍 Attempting to fetch video info with Chrome impersonation..."
+          echo "🔍 Fetching info with impersonation and filesize approximation..."
           if yt-dlp -J --no-playlist \
             --impersonate "chrome" \
             --extractor-retries 3 \
+            --compat-option manifest-filesize-approx \
             "${{ github.event.inputs.video_url }}" > info.json 2> err.log; then
 
             echo "✅ Successfully fetched info."
@@ -142,7 +143,7 @@ jobs:
             echo "| Format ID | Ext | Resolution | VCodec | Size (MB) |" >> $GITHUB_STEP_SUMMARY
             echo "|-----------|-----|------------|--------|-----------|" >> $GITHUB_STEP_SUMMARY
 
-            # ساخت هر ردیف با آرایه و join (بدون خطای پرانتز)
+            # فرمت‌بندی حجم: اگر 0 بود، "?" نمایش داده می‌شود
             jq -r '
               .formats[]
               | select(.vcodec != "none" and .vcodec != null)
@@ -151,13 +152,29 @@ jobs:
                   (.ext // "-"),
                   (.resolution // "-"),
                   ((.vcodec // "") | split(".")[0]),
-                  (((.filesize // .filesize_approx // 0) / 1048576) | floor | tostring)
+                  (
+                    ((.filesize // .filesize_approx // 0) / 1048576)
+                    | floor
+                    | if . == 0 then "?" else tostring end
+                  )
                 ]
               | "| " + join(" | ") + " |"
             ' info.json >> $GITHUB_STEP_SUMMARY
 
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "💡 شناسه فرمت را کپی کنید و ورک‌فلو را دوباره با format_id اجرا کنید." >> $GITHUB_STEP_SUMMARY
+            echo "💡 **نکته:** علامت «?» یعنی حجم هنوز از سمت سایت اعلام نشده." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            # جدول جایگزین با خروجی yt-dlp -F (گاهی حجم دقیق‌تری نشان می‌دهد)
+            echo "### 📊 جدول دقیق‌تر (yt-dlp -F)" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            yt-dlp -F \
+              --impersonate "chrome" \
+              --extractor-retries 3 \
+              --compat-option manifest-filesize-approx \
+              "${{ github.event.inputs.video_url }}" >> $GITHUB_STEP_SUMMARY 2>&1 || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+
           else
             echo "❌ Failed to fetch info even with impersonation."
             echo "--- Error Log ---"
