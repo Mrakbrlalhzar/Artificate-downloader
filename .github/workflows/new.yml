@@ -16,6 +16,11 @@ on:
         required: true
         type: boolean
         default: true
+      aggressive_compression:
+        description: 'حالت تهاجمی (CRF بالاتر، پریست کندتر)'
+        required: true
+        type: boolean
+        default: false
       video_codec:
         description: 'کدک ویدیو'
         required: true
@@ -33,6 +38,27 @@ on:
         type: choice
         default: 'medium'
         options: [ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow]
+      svtav1_preset:
+        description: 'SVT-AV1 preset (0-13)'
+        required: false
+        type: number
+        default: 8
+      audio_codec:
+        description: 'کدک صدا'
+        required: true
+        type: choice
+        default: 'aac'
+        options: [aac, libopus]
+      audio_bitrate:
+        description: 'بیتریت صدا'
+        required: false
+        type: string
+        default: '128k'
+      package_as_7z:
+        description: 'بسته‌بندی با 7z (تأثیر کم روی MP4)'
+        required: true
+        type: boolean
+        default: false
 
 jobs:
   process:
@@ -41,51 +67,103 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="${{ github.event.inputs.video_url }}"
+          if [ -z "${URL// }" ]; then echo "❌ video_url خالی است"; exit 1; fi
+          if ! [[ "$URL" =~ ^https?:// ]]; then echo "❌ video_url باید با http(s):// شروع شود"; exit 1; fi
+          if [ "${{ github.event.inputs.aggressive_compression }}" = "true" ] && \
+             [ "${{ github.event.inputs.compress }}" != "true" ]; then
+            echo "⚠️ aggressive_compression=true ولی compress=false → حالت تهاجمی نادیده گرفته می‌شود."
+          fi
+
       - name: Setup FFmpeg
         uses: FedericoCarboni/setup-ffmpeg@v3
         with:
           ffmpeg-version: release
 
-      - name: Setup Python & yt-dlp with all dependencies
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install yt-dlp with compatible curl_cffi
         shell: bash
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          # نصب yt-dlp و curl_cffi سازگار
           pip install --upgrade yt-dlp
           pip install "curl_cffi>=0.10,<0.16"
-          # نصب aria2 برای دانلود سریع‌تر (اختیاری)
-          sudo apt-get update -qq && sudo apt-get install -y -qq aria2
-          
-          echo "--- Impersonation Targets ---"
+
+          echo "--- yt-dlp version ---"
+          yt-dlp --version
+          echo "--- Impersonation targets ---"
           yt-dlp --list-impersonate-targets
+
+      - name: Verify FFmpeg codecs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for codec in libx264 libx265 libsvtav1 libopus aac; do
+            if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q " $codec "; then
+              echo "✅ $codec"
+            else
+              echo "❌ $codec NOT available"
+            fi
+          done
+
+      - name: Install aria2
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2
+          aria2c --version | head -n 1
 
       - name: List Formats (Attempt with impersonation)
         if: ${{ github.event.inputs.format_id == '' }}
         shell: bash
         run: |
           set -euo pipefail
-          # تلاش برای دریافت اطلاعات با جعل هویت مرورگر کروم
           echo "🔍 Attempting to fetch video info with Chrome impersonation..."
           if yt-dlp -J --no-playlist \
             --impersonate "chrome" \
             --extractor-retries 3 \
             "${{ github.event.inputs.video_url }}" > info.json 2> err.log; then
-            
+
             echo "✅ Successfully fetched info."
-            echo "## 📋 Video Formats" >> $GITHUB_STEP_SUMMARY
+            TITLE=$(jq -r '.title // "unknown"' info.json)
+            DURATION=$(jq -r '.duration // 0' info.json)
+            echo "## 📋 $TITLE" >> $GITHUB_STEP_SUMMARY
+            echo "**مدت:** ${DURATION}s" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
             echo "| Format ID | Ext | Resolution | VCodec | Size (MB) |" >> $GITHUB_STEP_SUMMARY
             echo "|-----------|-----|------------|--------|-----------|" >> $GITHUB_STEP_SUMMARY
-            # اصلاح jq برای جلوگیری از خطای split روی null
-            jq -r '.formats[] | select(.vcodec != "none") |
-              "| \(.format_id) | \(.ext) | \(.resolution // "-") | \((.vcodec // "" | split(".")[0]) | \((.filesize // .filesize_approx // 0) / 1048576 | floor) |"' info.json >> $GITHUB_STEP_SUMMARY
+
+            # ساخت هر ردیف با آرایه و join (بدون خطای پرانتز)
+            jq -r '
+              .formats[]
+              | select(.vcodec != "none" and .vcodec != null)
+              | [
+                  (.format_id // "-"),
+                  (.ext // "-"),
+                  (.resolution // "-"),
+                  ((.vcodec // "") | split(".")[0]),
+                  (((.filesize // .filesize_approx // 0) / 1048576) | floor | tostring)
+                ]
+              | "| " + join(" | ") + " |"
+            ' info.json >> $GITHUB_STEP_SUMMARY
+
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "💡 شناسه فرمت را کپی کنید و ورک‌فلو را دوباره با format_id اجرا کنید." >> $GITHUB_STEP_SUMMARY
           else
             echo "❌ Failed to fetch info even with impersonation."
             echo "--- Error Log ---"
             cat err.log
             echo "### ⚠️ Diagnostic Failed" >> $GITHUB_STEP_SUMMARY
             echo "Could not retrieve video info. The site likely requires **cookies** or is blocking the GitHub Actions IP." >> $GITHUB_STEP_SUMMARY
-            echo "See the error log above for details." >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
 
@@ -96,69 +174,100 @@ jobs:
           set -euo pipefail
           mkdir -p original
           URL="${{ github.event.inputs.video_url }}"
-          FORMAT="${{ github.event.inputs.format_id }}"
-          
-          # روش 1: Impersonation با Chrome
-          echo "📥 Method 1: Trying with Chrome impersonation..."
+          FORMAT_ID=$(echo "${{ github.event.inputs.format_id }}" | xargs)
+          FORMAT_SPEC="${FORMAT_ID}+ba/${FORMAT_ID}/bv*+ba/b"
+          echo "📥 Format spec: $FORMAT_SPEC"
+
+          echo "📥 Method 1: Chrome impersonation..."
           if yt-dlp --no-playlist \
+            --no-write-subs --no-write-auto-subs --no-write-thumbnail \
+            --no-part \
             --impersonate "chrome" \
-            --retries 5 --fragment-retries 5 --extractor-retries 5 \
+            --retries 5 --fragment-retries 5 --extractor-retries 5 --retry-sleep 2 \
             --merge-output-format mp4 \
-            -f "${FORMAT}+ba/${FORMAT}/bv*+ba/b" \
+            -f "$FORMAT_SPEC" \
             --output "original/%(title).200B.%(ext)s" \
             "$URL"; then
-            
-            echo "✅ Download successful with Method 1."
+            echo "✅ Download succeeded with Method 1."
           else
             echo "⚠️ Method 1 failed. Trying Method 2 (Safari impersonation)..."
-            # روش 2: Impersonation با Safari (گاهی برای برخی سایت‌ها بهتر جواب می‌دهد)
             yt-dlp --no-playlist \
+              --no-write-subs --no-write-auto-subs --no-write-thumbnail \
+              --no-part \
               --impersonate "safari" \
-              --retries 5 --fragment-retries 5 --extractor-retries 5 \
+              --retries 5 --fragment-retries 5 --extractor-retries 5 --retry-sleep 2 \
               --merge-output-format mp4 \
-              -f "${FORMAT}+ba/${FORMAT}/bv*+ba/b" \
+              -f "$FORMAT_SPEC" \
               --output "original/%(title).200B.%(ext)s" \
               "$URL"
           fi
-          
+
           echo "--- Downloaded Files ---"
           ls -lh original/
 
-      - name: Compress (if requested)
+      - name: Compress
         if: ${{ github.event.inputs.format_id != '' && github.event.inputs.compress == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p output
           INPUT=$(find original -maxdepth 1 -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" \) | head -n 1)
-          [ -z "$INPUT" ] && { echo "❌ No input file found"; exit 1; }
+          [ -z "$INPUT" ] && { echo "❌ فایل ورودی پیدا نشد"; exit 1; }
           BASENAME=$(basename "$INPUT"); BASENAME="${BASENAME%.*}"
-          
+
           VCODEC="${{ github.event.inputs.video_codec }}"
           CRF="${{ github.event.inputs.crf }}"
           PRESET="${{ github.event.inputs.preset }}"
-          
-          # اعتبارسنجی CRF
-          [[ "$CRF" =~ ^[0-9]+$ ]] || { echo "❌ CRF must be an integer"; exit 1; }
-          
-          # محدود کردن CRF بر اساس کدک
-          case "$VCODEC" in libx264|libx265) MAX=51;; libsvtav1) MAX=63;; *) MAX=51;; esac
-          [ "$CRF" -gt "$MAX" ] && CRF=$MAX
-          
+          SVT_PRESET="${{ github.event.inputs.svtav1_preset }}"
+          ACODEC="${{ github.event.inputs.audio_codec }}"
+          ABITRATE="${{ github.event.inputs.audio_bitrate }}"
+
+          [[ "$CRF" =~ ^[0-9]+$ ]] || { echo "❌ CRF باید عدد صحیح باشد"; exit 1; }
+
+          case "$VCODEC" in
+            libx264|libx265) MAX_CRF=51 ;;
+            libsvtav1) MAX_CRF=63 ;;
+            *) MAX_CRF=51 ;;
+          esac
+
+          if [ "${{ github.event.inputs.aggressive_compression }}" = "true" ]; then
+            echo "⚡ حالت تهاجمی فعال"
+            CRF=$((CRF + 6))
+            case "$VCODEC" in
+              libx264|libx265) PRESET="veryslow" ;;
+              libsvtav1) SVT_PRESET=4 ;;
+            esac
+            ABITRATE="96k"
+          fi
+
+          if [ "$CRF" -gt "$MAX_CRF" ]; then
+            echo "⚠️ CRF=$CRF > max=$MAX_CRF → محدود شد"
+            CRF=$MAX_CRF
+          fi
+
+          if [ "$ACODEC" = "libopus" ]; then
+            OUT_EXT="mkv"
+            echo "ℹ️ audio_codec=libopus → خروجی .mkv"
+          else
+            OUT_EXT="mp4"
+          fi
+          OUT_FILE="output/${BASENAME}_optimized.${OUT_EXT}"
+
           VPARAMS=(-c:v "$VCODEC")
           case "$VCODEC" in
             libx264|libx265) VPARAMS+=(-preset "$PRESET" -crf "$CRF") ;;
-            libsvtav1) VPARAMS+=(-preset 8 -crf "$CRF") ;;
+            libsvtav1) VPARAMS+=(-preset "$SVT_PRESET" -crf "$CRF") ;;
           esac
-          
-          OUT_FILE="output/${BASENAME}_optimized.mp4"
+
+          echo "🎬 ffmpeg ${VPARAMS[*]} -c:a $ACODEC -b:a $ABITRATE"
           ffmpeg -y -hide_banner -loglevel warning -i "$INPUT" \
-            "${VPARAMS[@]}" -c:a aac -b:a 128k \
+            "${VPARAMS[@]}" -c:a "$ACODEC" -b:a "$ABITRATE" \
             -movflags +faststart "$OUT_FILE"
-          
+
           IN_SIZE=$(stat -c%s "$INPUT"); OUT_SIZE=$(stat -c%s "$OUT_FILE")
+          echo "📊 اصلی: $IN_SIZE بایت | فشرده: $OUT_SIZE بایت"
           if [ "$OUT_SIZE" -ge "$IN_SIZE" ]; then
-            echo "⚠️ Compression increased size; keeping original."
+            echo "⚠️ فشرده‌سازی حجم را کم نکرد؛ نسخه‌ی اصلی حفظ می‌شود."
             cp "$INPUT" "output/$(basename "$INPUT")"
             rm -f "$OUT_FILE"
           fi
@@ -171,12 +280,37 @@ jobs:
           set -euo pipefail
           mkdir -p output
           find original -maxdepth 1 -type f -exec cp {} output/ \;
+          ls -lh output/
 
-      - name: Upload Artifact
+      - name: Package
+        if: ${{ github.event.inputs.format_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          [ -z "$(ls -A output)" ] && { echo "❌ پوشه output خالی است"; exit 1; }
+
+          if [ "${{ github.event.inputs.package_as_7z }}" = "true" ]; then
+            command -v 7z &>/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full; }
+            echo "📦 بسته‌بندی با 7z..."
+            7z a -t7z -mx=9 -mfb=273 -ms=on artifact/video.7z output/*
+          else
+            echo "📁 ارسال مستقیم"
+            find output -maxdepth 1 -type f -exec cp {} artifact/ \;
+          fi
+          ls -lh artifact/
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 فایل نهایی" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -lh artifact/ >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload artifact
         if: ${{ github.event.inputs.format_id != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: final-video
-          path: output/
+          path: artifact/
           retention-days: 7
           if-no-files-found: error
