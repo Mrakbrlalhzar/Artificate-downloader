@@ -1,4 +1,4 @@
-name: Ultimate Video Downloader (Diagnostic)
+name: Ultimate Video Downloader (Cached Tools)
 
 on:
   workflow_dispatch:
@@ -39,7 +39,7 @@ on:
         default: 'medium'
         options: [ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow]
       svtav1_preset:
-        description: 'SVT-AV1 preset (0-13)'
+        description: 'SVT-AV1 preset (0-13. بالاتر = سریع‌تر)'
         required: false
         type: number
         default: 8
@@ -62,10 +62,85 @@ on:
 
 jobs:
   process:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
+
+      # ============================================================
+      # بازیابی ابزارهای کش‌شده (بدون نصب مجدد)
+      # ============================================================
+      - name: Restore cached FFmpeg (with SVT-AV1)
+        uses: actions/cache@v4
+        with:
+          path: ./ffmpeg-static
+          key: ffmpeg-7.1-svtav1-3.0.2-prebuilt-true-${{ runner.os }}
+
+      - name: Add FFmpeg to PATH
+        shell: bash
+        run: |
+          if [ ! -f "${{ github.workspace }}/ffmpeg-static/bin/ffmpeg" ]; then
+            echo "❌ FFmpeg cache not found! Run the 'Setup Build Cache' workflow first."
+            exit 1
+          fi
+          echo "${{ github.workspace }}/ffmpeg-static/bin" >> $GITHUB_PATH
+
+      - name: Restore cached Python site-packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/lib/python3.12/site-packages
+            ~/.local/bin
+          key: pysite-2026.10.26-0.15.0-${{ runner.os }}
+
+      - name: Add Python user bin to PATH
+        shell: bash
+        run: |
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          if ! command -v yt-dlp &> /dev/null; then
+            echo "❌ yt-dlp cache not found! Run the 'Setup Build Cache' workflow first."
+            exit 1
+          fi
+          yt-dlp --version
+
+      - name: Restore cached aria2
+        uses: actions/cache@v4
+        with:
+          path: /tmp/aria2-bin
+          key: aria2-${{ runner.os }}-v1.37.0
+
+      - name: Install aria2 if not cached
+        shell: bash
+        run: |
+          if [ -f /tmp/aria2-bin/aria2c ]; then
+            sudo cp /tmp/aria2-bin/aria2c /usr/local/bin/aria2c
+            sudo chmod +x /usr/local/bin/aria2c
+          else
+            sudo apt-get update -qq && sudo apt-get install -y -qq aria2
+          fi
+          aria2c --version | head -n 1
+
+      # ============================================================
+      # تأیید ابزارها و اعتبارسنجی ورودی‌ها
+      # ============================================================
+      - name: Verify tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "--- FFmpeg ---"
+          ffmpeg -version | head -n 1
+          echo "--- Codecs ---"
+          for codec in libx264 libx265 libsvtav1 libopus aac; do
+            if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q " $codec "; then
+              echo "✅ $codec"
+            else
+              echo "❌ $codec NOT available"
+            fi
+          done
+          echo "--- yt-dlp ---"
+          yt-dlp --version
+          echo "--- curl_cffi ---"
+          python -c "import curl_cffi; print('curl_cffi:', curl_cffi.__version__)"
 
       - name: Validate inputs
         shell: bash
@@ -79,45 +154,9 @@ jobs:
             echo "⚠️ aggressive_compression=true ولی compress=false → حالت تهاجمی نادیده گرفته می‌شود."
           fi
 
-      - name: Setup FFmpeg
-        uses: FedericoCarboni/setup-ffmpeg@v3
-        with:
-          ffmpeg-version: release
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install yt-dlp with compatible curl_cffi
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          pip install --upgrade yt-dlp
-          pip install "curl_cffi>=0.10,<0.16"
-          yt-dlp --version
-
-      - name: Verify FFmpeg codecs
-        shell: bash
-        run: |
-          set -euo pipefail
-          for codec in libx264 libx265 libsvtav1 libopus aac; do
-            if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q " $codec "; then
-              echo "✅ $codec"
-            else
-              echo "❌ $codec NOT available"
-            fi
-          done
-
-      - name: Install aria2
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2
-          aria2c --version | head -n 1
-
+      # ============================================================
+      # لیست فرمت‌ها (اگر format_id خالی بود)
+      # ============================================================
       - name: List Formats (parse -F output)
         if: ${{ github.event.inputs.format_id == '' }}
         shell: bash
@@ -126,7 +165,6 @@ jobs:
           URL="${{ github.event.inputs.video_url }}"
           echo "🔍 Fetching format table via -F..."
 
-          # گرفتن جدول کامل فرمت‌ها با حجم تخمینی
           if ! yt-dlp -F \
             --impersonate "chrome" \
             --extractor-retries 3 \
@@ -139,7 +177,6 @@ jobs:
             exit 1
           fi
 
-          # گرفتن عنوان و مدت با -J (سریع، بدون دانلود)
           yt-dlp -J --no-warnings \
             --impersonate "chrome" \
             --extractor-retries 3 \
@@ -154,7 +191,6 @@ jobs:
           echo "| Format ID | Ext | Resolution | FPS | VCodec | Size |" >> $GITHUB_STEP_SUMMARY
           echo "|-----------|-----|------------|-----|--------|------|" >> $GITHUB_STEP_SUMMARY
 
-          # پارس جدول -F با awk (پایدار و مقاوم به تغییرات جزئی)
           awk -F'[|]' '
             /^---/ { in_table=1; next }
             in_table && NF >= 3 {
@@ -188,8 +224,6 @@ jobs:
 
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "💡 شناسه فرمت را کپی کنید و ورک‌فلو را دوباره با format_id اجرا کنید." >> $GITHUB_STEP_SUMMARY
-
-          # نمایش خروجی خام -F برای دیباگ (قابل باز و بسته شدن)
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "<details><summary>🔍 خروجی خام -F (برای دیباگ)</summary>" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -198,6 +232,9 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "</details>" >> $GITHUB_STEP_SUMMARY
 
+      # ============================================================
+      # دانلود
+      # ============================================================
       - name: Download (with fallback)
         if: ${{ github.event.inputs.format_id != '' }}
         shell: bash
@@ -234,6 +271,9 @@ jobs:
           fi
           ls -lh original/
 
+      # ============================================================
+      # فشرده‌سازی با FFmpeg
+      # ============================================================
       - name: Compress
         if: ${{ github.event.inputs.format_id != '' && github.event.inputs.compress == 'true' }}
         shell: bash
@@ -260,6 +300,7 @@ jobs:
           esac
 
           if [ "${{ github.event.inputs.aggressive_compression }}" = "true" ]; then
+            echo "⚡ حالت تهاجمی فعال"
             CRF=$((CRF + 6))
             case "$VCODEC" in
               libx264|libx265) PRESET="veryslow" ;;
@@ -267,7 +308,11 @@ jobs:
             esac
             ABITRATE="96k"
           fi
-          [ "$CRF" -gt "$MAX_CRF" ] && CRF=$MAX_CRF
+
+          if [ "$CRF" -gt "$MAX_CRF" ]; then
+            echo "⚠️ CRF=$CRF > max=$MAX_CRF → محدود شد"
+            CRF=$MAX_CRF
+          fi
 
           if [ "$ACODEC" = "libopus" ]; then OUT_EXT="mkv"; else OUT_EXT="mp4"; fi
           OUT_FILE="output/${BASENAME}_optimized.${OUT_EXT}"
@@ -278,18 +323,23 @@ jobs:
             libsvtav1) VPARAMS+=(-preset "$SVT_PRESET" -crf "$CRF") ;;
           esac
 
+          echo "🎬 ffmpeg ${VPARAMS[*]} -c:a $ACODEC -b:a $ABITRATE"
           ffmpeg -y -hide_banner -loglevel warning -i "$INPUT" \
             "${VPARAMS[@]}" -c:a "$ACODEC" -b:a "$ABITRATE" \
             -movflags +faststart "$OUT_FILE"
 
           IN_SIZE=$(stat -c%s "$INPUT"); OUT_SIZE=$(stat -c%s "$OUT_FILE")
-          echo "📊 اصلی: $IN_SIZE | فشرده: $OUT_SIZE"
+          echo "📊 اصلی: $IN_SIZE بایت | فشرده: $OUT_SIZE بایت"
           if [ "$OUT_SIZE" -ge "$IN_SIZE" ]; then
+            echo "⚠️ فشرده‌سازی حجم را کم نکرد؛ نسخه‌ی اصلی حفظ می‌شود."
             cp "$INPUT" "output/$(basename "$INPUT")"
             rm -f "$OUT_FILE"
           fi
           ls -lh output/
 
+      # ============================================================
+      # کپی نسخه‌ی اصلی (اگر فشرده‌سازی غیرفعال باشد)
+      # ============================================================
       - name: Copy Original (if not compressing)
         if: ${{ github.event.inputs.format_id != '' && github.event.inputs.compress != 'true' }}
         shell: bash
@@ -299,6 +349,9 @@ jobs:
           find original -maxdepth 1 -type f -exec cp {} output/ \;
           ls -lh output/
 
+      # ============================================================
+      # بسته‌بندی (اختیاری 7z یا مستقیم)
+      # ============================================================
       - name: Package
         if: ${{ github.event.inputs.format_id != '' }}
         shell: bash
@@ -306,14 +359,26 @@ jobs:
           set -euo pipefail
           mkdir -p artifact
           [ -z "$(ls -A output)" ] && { echo "❌ پوشه output خالی است"; exit 1; }
+
           if [ "${{ github.event.inputs.package_as_7z }}" = "true" ]; then
             command -v 7z &>/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full; }
+            echo "📦 بسته‌بندی با 7z..."
             7z a -t7z -mx=9 -mfb=273 -ms=on artifact/video.7z output/*
           else
+            echo "📁 ارسال مستقیم"
             find output -maxdepth 1 -type f -exec cp {} artifact/ \;
           fi
-          ls -lh artifact/ >> $GITHUB_STEP_SUMMARY
+          ls -lh artifact/
 
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 فایل نهایی" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -lh artifact/ >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      # ============================================================
+      # آپلود آرتیفکت
+      # ============================================================
       - name: Upload artifact
         if: ${{ github.event.inputs.format_id != '' }}
         uses: actions/upload-artifact@v4
