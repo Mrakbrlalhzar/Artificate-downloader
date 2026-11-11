@@ -1,0 +1,258 @@
+name: Download, Compress & Package Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'لینک ویدیو'
+        required: true
+        type: string
+      format_id:
+        description: 'شناسه فرمت (خالی = فقط لیست کیفیت‌ها)'
+        required: false
+        type: string
+      compress:
+        description: 'فشرده‌سازی با FFmpeg؟'
+        required: true
+        type: boolean
+        default: true
+      aggressive_compression:
+        description: 'حالت تهاجمی (CRF بالاتر، پریست کندتر، حداقل حجم)'
+        required: true
+        type: boolean
+        default: false
+      video_codec:
+        description: 'کدک ویدیو'
+        required: true
+        type: choice
+        default: 'libx264'
+        options: [libx264, libx265, libsvtav1]
+      crf:
+        description: 'CRF (x264/x265=0-51، SVT-AV1=0-63). بالاتر=حجم کمتر'
+        required: true
+        type: number
+        default: 23
+      preset:
+        description: 'پریست (x264/x265)'
+        required: false
+        type: choice
+        default: 'medium'
+        options: [ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow]
+      svtav1_preset:
+        description: 'SVT-AV1 preset (0-13. بالاتر=سریع‌تر)'
+        required: false
+        type: number
+        default: 8
+      audio_codec:
+        description: 'کدک صدا'
+        required: true
+        type: choice
+        default: 'aac'
+        options: [aac, libopus]
+      audio_bitrate:
+        description: 'بیتریت صدا'
+        required: false
+        type: string
+        default: '128k'
+      package_as_7z:
+        description: 'بسته‌بندی با 7z. توجه: روی MP4 تأثیر کمی دارد (< ۵٪).'
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="${{ github.event.inputs.video_url }}"
+          if [ -z "${URL// }" ]; then echo "❌ video_url خالی است"; exit 1; fi
+          if ! [[ "$URL" =~ ^https?:// ]]; then echo "❌ video_url باید با http(s):// شروع شود"; exit 1; fi
+          if [ "${{ github.event.inputs.aggressive_compression }}" = "true" ] && \
+             [ "${{ github.event.inputs.compress }}" != "true" ]; then
+            echo "⚠️ aggressive_compression=true ولی compress=false → حالت تهاجمی نادیده گرفته می‌شود."
+          fi
+
+      - name: Setup FFmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          ffmpeg-version: release
+
+      - name: Verify FFmpeg codecs
+        shell: bash
+        run: |
+          set -euo pipefail
+          ffmpeg -version | head -n 1
+          for codec in libx264 libx265 libsvtav1 libopus aac; do
+            if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q " $codec "; then
+              echo "✅ $codec available"
+            else
+              echo "❌ $codec NOT available"
+            fi
+          done
+
+      - name: Setup yt-dlp
+        uses: AnimMouse/setup-yt-dlp@v3
+        with:
+          ffmpeg: false
+          aria2: true
+
+      - name: List formats
+        if: ${{ github.event.inputs.format_id == '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          yt-dlp -J --no-playlist --no-write-subs --no-write-auto-subs \
+            "${{ github.event.inputs.video_url }}" > info.json
+
+          TITLE=$(jq -r '.title // "unknown"' info.json)
+          DURATION=$(jq -r '.duration // 0' info.json)
+          echo "## 📋 $TITLE" >> $GITHUB_STEP_SUMMARY
+          echo "**مدت:** ${DURATION}s" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Format ID | Ext | Resolution | FPS | VCodec | Size (MB) |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-----|------------|-----|--------|-----------|" >> $GITHUB_STEP_SUMMARY
+          jq -r '.formats[] | select(.vcodec != "none") |
+            "| \(.format_id) | \(.ext) | \(.resolution // "-") | \(.fps // "-") | \(.vcodec | split(".")[0]) | \((.filesize // .filesize_approx // 0) / 1048576 | floor) |"' info.json >> $GITHUB_STEP_SUMMARY
+
+      - name: Download
+        if: ${{ github.event.inputs.format_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          FORMAT_ID=$(echo "${{ github.event.inputs.format_id }}" | xargs)
+          URL="${{ github.event.inputs.video_url }}"
+          mkdir -p original
+
+          FORMAT_SPEC="${FORMAT_ID}+ba/${FORMAT_ID}/bv*+ba/b"
+          echo "📥 Format spec: $FORMAT_SPEC"
+
+          yt-dlp \
+            --no-playlist \
+            --no-write-subs --no-write-auto-subs --no-write-thumbnail \
+            --no-part \
+            --retries 3 --fragment-retries 3 --retry-sleep 2 \
+            --merge-output-format mp4 \
+            -f "$FORMAT_SPEC" \
+            --output "original/%(title).200B.%(ext)s" \
+            "$URL"
+
+          echo "--- دانلود شده ---"
+          ls -lh original/
+
+      - name: Compress
+        if: ${{ github.event.inputs.format_id != '' && github.event.inputs.compress == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          INPUT=$(find original -maxdepth 1 -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" \) | head -n 1)
+          [ -z "$INPUT" ] && { echo "❌ فایل ورودی پیدا نشد"; exit 1; }
+          BASENAME=$(basename "$INPUT"); BASENAME="${BASENAME%.*}"
+
+          VCODEC="${{ github.event.inputs.video_codec }}"
+          CRF="${{ github.event.inputs.crf }}"
+          PRESET="${{ github.event.inputs.preset }}"
+          SVT_PRESET="${{ github.event.inputs.svtav1_preset }}"
+          ACODEC="${{ github.event.inputs.audio_codec }}"
+          ABITRATE="${{ github.event.inputs.audio_bitrate }}"
+
+          if ! [[ "$CRF" =~ ^[0-9]+$ ]]; then echo "❌ CRF باید عدد صحیح باشد"; exit 1; fi
+
+          case "$VCODEC" in
+            libx264|libx265) MAX_CRF=51 ;;
+            libsvtav1) MAX_CRF=63 ;;
+            *) MAX_CRF=51 ;;
+          esac
+
+          if [ "${{ github.event.inputs.aggressive_compression }}" = "true" ]; then
+            echo "⚡ حالت تهاجمی فعال"
+            CRF=$((CRF + 6))
+            case "$VCODEC" in
+              libx264|libx265) PRESET="veryslow" ;;
+              libsvtav1) SVT_PRESET=4 ;;
+            esac
+            ABITRATE="96k"
+          fi
+
+          if [ "$CRF" -gt "$MAX_CRF" ]; then
+            echo "⚠️ CRF=$CRF > max=$MAX_CRF → محدود شد به $MAX_CRF"
+            CRF=$MAX_CRF
+          fi
+
+          # انتخاب پسوند خروجی بر اساس کدک صدا
+          if [ "$ACODEC" = "libopus" ]; then
+            OUT_EXT="mkv"  # Opus در mp4 غیراستاندارد است
+            echo "ℹ️ چون audio_codec=libopus، خروجی .mkv خواهد بود."
+          else
+            OUT_EXT="mp4"
+          fi
+          OUT_FILE="output/${BASENAME}_optimized.${OUT_EXT}"
+
+          VPARAMS=(-c:v "$VCODEC")
+          case "$VCODEC" in
+            libx264|libx265) VPARAMS+=(-preset "$PRESET" -crf "$CRF") ;;
+            libsvtav1) VPARAMS+=(-preset "$SVT_PRESET" -crf "$CRF") ;;
+          esac
+
+          echo "🎬 ffmpeg ${VPARAMS[*]} -c:a $ACODEC -b:a $ABITRATE → $OUT_FILE"
+          ffmpeg -y -hide_banner -loglevel warning -i "$INPUT" \
+            "${VPARAMS[@]}" -c:a "$ACODEC" -b:a "$ABITRATE" \
+            -movflags +faststart "$OUT_FILE"
+
+          # مقایسه حجم: اگر خروجی بزرگ‌تر شد، نسخه‌ی اصلی را نگه دار
+          IN_SIZE=$(stat -c%s "$INPUT")
+          OUT_SIZE=$(stat -c%s "$OUT_FILE")
+          echo "📊 اصلی: $IN_SIZE بایت | فشرده: $OUT_SIZE بایت"
+          if [ "$OUT_SIZE" -ge "$IN_SIZE" ]; then
+            echo "⚠️ فشرده‌سازی حجم را کم نکرد؛ نسخه‌ی اصلی حفظ می‌شود."
+            cp "$INPUT" "output/$(basename "$INPUT")"
+            rm -f "$OUT_FILE"
+          fi
+          ls -lh output/
+
+      - name: Copy original (if not compressing)
+        if: ${{ github.event.inputs.format_id != '' && github.event.inputs.compress != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          find original -maxdepth 1 -type f -exec cp {} output/ \;
+          ls -lh output/
+
+      - name: Package
+        if: ${{ github.event.inputs.format_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          if [ -z "$(ls -A output)" ]; then echo "❌ پوشه output خالی است"; exit 1; fi
+
+          if [ "${{ github.event.inputs.package_as_7z }}" = "true" ]; then
+            command -v 7z &>/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full; }
+            echo "📦 بسته‌بندی با 7z (max compression)..."
+            7z a -t7z -mx=9 -mfb=273 -ms=on artifact/video.7z output/*
+          else
+            echo "📁 ارسال مستقیم"
+            find output -maxdepth 1 -type f -exec cp {} artifact/ \;
+          fi
+          ls -lh artifact/
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 فایل نهایی" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -lh artifact/ >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload artifact
+        if: ${{ github.event.inputs.format_id != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-video
+          path: artifact/
+          retention-days: 7
+          if-no-files-found: error
