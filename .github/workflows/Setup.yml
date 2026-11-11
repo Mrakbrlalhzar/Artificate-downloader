@@ -7,48 +7,73 @@ on:
         description: 'نسخه FFmpeg (مثلاً 7.1)'
         required: true
         default: '7.1'
+        type: string
       svt_av1_version:
         description: 'نسخه SVT-AV1 (مثلاً 3.0.2)'
         required: true
         default: '3.0.2'
+        type: string
       use_prebuilt_ffmpeg:
         description: 'استفاده از باینری آماده (سریع‌تر) به جای بیلد از سورس'
         required: true
         type: boolean
-        default: true # پیشنهاد می‌شود برای سرعت بیشتر
+        default: true
+      yt_dlp_version:
+        description: 'نسخه yt-dlp (مثلاً 2026.10.26)'
+        required: true
+        default: '2026.10.26'
+        type: string
+      curl_cffi_version:
+        description: 'نسخه curl_cffi (مثلاً 0.15.0)'
+        required: true
+        default: '0.15.0'
+        type: string
 
 jobs:
+  # ============================================================
+  # Job 1: FFmpeg (prebuilt یا build from source) + Cache
+  # ============================================================
   cache-ffmpeg:
+    name: Cache FFmpeg
     runs-on: ubuntu-24.04
-    timeout-minutes: 30 # کاهش تایم‌اوت برای جلوگیری از انتظار طولانی
+    timeout-minutes: 60
     steps:
       - name: Restore FFmpeg from cache
         id: cache-ffmpeg
         uses: actions/cache@v4
         with:
           path: ./ffmpeg-static
-          key: ffmpeg-${{ inputs.ffmpeg_version }}-svtav1-${{ inputs.svt_av1_version }}-${{ inputs.use_prebuilt_ffmpeg }}-${{ runner.os }}
+          key: ffmpeg-${{ inputs.ffmpeg_version }}-svtav1-${{ inputs.svt_av1_version }}-prebuilt-${{ inputs.use_prebuilt_ffmpeg }}-${{ runner.os }}
 
-      # --- مسیر ۱: استفاده از باینری آماده (اگر کش نبود و گزینه فعال باشد) ---
+      # ---------- مسیر ۱: باینری آماده ----------
       - name: Download prebuilt FFmpeg with SVT-AV1
-        if: steps.cache-ffmpeg.outputs.cache-hit != 'true' && inputs.use_prebuilt_ffmpeg == true
+        if: ${{ steps.cache-ffmpeg.outputs.cache-hit != 'true' && fromJSON(inputs.use_prebuilt_ffmpeg) == true }}
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p ffmpeg-static/bin
-          # دانلود از ریلیزهای پروژه nekotrix (باینری استاتیک لینوکس)
-          # توجه: لینک را می‌توانی با آخرین نسخه جایگزین کنی
-          wget -q https://github.com/nekotrix/FFmpeg-Builds-SVT-AV1-Essential/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz -O ffmpeg.tar.xz
-          tar -xf ffmpeg.tar.xz -C ffmpeg-static --strip-components=1
-          echo "✅ Prebuilt FFmpeg downloaded."
+          echo "📥 Downloading prebuilt FFmpeg with SVT-AV1..."
+          wget -q --show-progress \
+            "https://github.com/nekotrix/FFmpeg-Builds-SVT-AV1-Essential/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz" \
+            -O /tmp/ffmpeg.tar.xz
+          tar -xf /tmp/ffmpeg.tar.xz -C ffmpeg-static --strip-components=1
+          chmod +x ffmpeg-static/bin/ffmpeg ffmpeg-static/bin/ffprobe || true
+          echo "✅ Prebuilt FFmpeg extracted."
+          ./ffmpeg-static/bin/ffmpeg -version | head -n 1
 
-      # --- مسیر ۲: بیلد از سورس (فقط اگر کش نبود و گزینه prebuilt غیرفعال باشد) ---
-      - name: Install build dependencies (with DNS/mirror fix)
-        if: steps.cache-ffmpeg.outputs.cache-hit != 'true' && inputs.use_prebuilt_ffmpeg != true
+      # ---------- مسیر ۲: بیلد از سورس ----------
+      - name: Install build dependencies
+        if: ${{ steps.cache-ffmpeg.outputs.cache-hit != 'true' && fromJSON(inputs.use_prebuilt_ffmpeg) != true }}
+        shell: bash
         run: |
-          # اعمال اصلاحات DNS و apt که در بالا توضیح داده شد
+          set -euo pipefail
+          # اصلاح DNS برای جلوگیری از خطای Temporary failure resolving
           sudo sh -c 'echo "nameserver 8.8.8.8" > /etc/resolv.conf'
           sudo sh -c 'echo "nameserver 8.8.4.4" >> /etc/resolv.conf'
-          sudo sed -i -e 's/azure\.//' /etc/apt/apt-mirrors.txt
-          echo 'Acquire::Retries "0";' | sudo tee /etc/apt/apt.conf.d/99-custom-retries
+          # حذف پیشوند azure از میرور برای failover سریع‌تر
+          sudo sed -i -e 's/azure\.//' /etc/apt/apt-mirrors.txt || true
+          # تایم‌اوت کوتاه و بدون retry تا سریع به میرور بعدی بره
+          echo 'Acquire::Retries "1";' | sudo tee /etc/apt/apt.conf.d/99-custom-retries
           echo 'Acquire::http::Timeout "20";' | sudo tee -a /etc/apt/apt.conf.d/99-custom-retries
           echo 'Acquire::https::Timeout "20";' | sudo tee -a /etc/apt/apt.conf.d/99-custom-retries
 
@@ -60,31 +85,129 @@ jobs:
             pkg-config texinfo wget zlib1g-dev nasm yasm
 
       - name: Build SVT-AV1
-        if: steps.cache-ffmpeg.outputs.cache-hit != 'true' && inputs.use_prebuilt_ffmpeg != true
+        if: ${{ steps.cache-ffmpeg.outputs.cache-hit != 'true' && fromJSON(inputs.use_prebuilt_ffmpeg) != true }}
+        shell: bash
         run: |
           set -euo pipefail
-          git clone --depth=1 --branch v${{ inputs.svt_av1_version }} https://github.com/OpenVisualCloud/SVT-AV1.git
-          cd SVT-AV1 && mkdir -p Build && cd Build
+          git clone --depth=1 --branch "v${{ inputs.svt_av1_version }}" \
+            https://github.com/OpenVisualCloud/SVT-AV1.git
+          cd SVT-AV1
+          mkdir -p Build && cd Build
           cmake .. -G"Unix Makefiles" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
-          make -j$(nproc) && sudo make install
+          make -j"$(nproc)"
+          sudo make install
+          echo "✅ SVT-AV1 v${{ inputs.svt_av1_version }} built and installed."
 
       - name: Build FFmpeg
-        if: steps.cache-ffmpeg.outputs.cache-hit != 'true' && inputs.use_prebuilt_ffmpeg != true
+        if: ${{ steps.cache-ffmpeg.outputs.cache-hit != 'true' && fromJSON(inputs.use_prebuilt_ffmpeg) != true }}
+        shell: bash
         run: |
           set -euo pipefail
-          git clone --depth=1 --branch n${{ inputs.ffmpeg_version }} https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          git clone --depth=1 --branch "n${{ inputs.ffmpeg_version }}" \
+            https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
           cd ffmpeg-src
           export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}"
           export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-          ./configure --prefix=/usr/local --enable-gpl --enable-libsvtav1 \
-            --enable-libx264 --enable-libx265 --enable-libopus \
-            --enable-static --disable-shared --disable-doc
-          make -j$(nproc) && make install
-          mkdir -p $GITHUB_WORKSPACE/ffmpeg-static/bin
-          cp /usr/local/bin/ffmpeg /usr/local/bin/ffprobe $GITHUB_WORKSPACE/ffmpeg-static/bin/
+          ./configure \
+            --prefix=/usr/local \
+            --enable-gpl \
+            --enable-libsvtav1 \
+            --enable-libx264 \
+            --enable-libx265 \
+            --enable-libopus \
+            --enable-static \
+            --disable-shared \
+            --disable-doc
+          make -j"$(nproc)"
+          make install
+          mkdir -p "${{ github.workspace }}/ffmpeg-static/bin"
+          cp /usr/local/bin/ffmpeg /usr/local/bin/ffprobe "${{ github.workspace }}/ffmpeg-static/bin/"
+          echo "✅ FFmpeg n${{ inputs.ffmpeg_version }} built and packaged."
 
+      - name: Verify FFmpeg binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${{ github.workspace }}/ffmpeg-static/bin/ffmpeg" -version | head -n 1
+          if "${{ github.workspace }}/ffmpeg-static/bin/ffmpeg" -hide_banner -encoders 2>/dev/null | grep -q "libsvtav1"; then
+            echo "✅ libsvtav1 is available in the cached FFmpeg."
+          else
+            echo "❌ libsvtav1 NOT available in the cached FFmpeg."
+            exit 1
+          fi
+
+  # ============================================================
+  # Job 2: yt-dlp + curl_cffi + aria2 + Cache
+  # ============================================================
   cache-pip-aria2:
+    name: Cache pip & aria2
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      # ... (بخش کش پکیج‌های پایتون و aria2 بدون تغییر باقی می‌ماند)
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Restore pip cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ inputs.yt_dlp_version }}-curl-cffi-${{ inputs.curl_cffi_version }}-${{ runner.os }}
+
+      - name: Restore Python site-packages
+        id: cache-pysite
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/lib/python3.12/site-packages
+            ~/.local/bin
+          key: pysite-${{ inputs.yt_dlp_version }}-${{ inputs.curl_cffi_version }}-${{ runner.os }}
+
+      - name: Install yt-dlp and curl_cffi
+        if: ${{ steps.cache-pysite.outputs.cache-hit != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install --user --no-cache-dir \
+            "yt-dlp==${{ inputs.yt_dlp_version }}" \
+            "curl_cffi==${{ inputs.curl_cffi_version }}"
+          echo "✅ yt-dlp version: $(~/.local/bin/yt-dlp --version || yt-dlp --version)"
+
+      - name: Verify Python packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          yt-dlp --version
+          python -c "import curl_cffi; print('curl_cffi:', curl_cffi.__version__)"
+
+      - name: Restore aria2 binary cache
+        id: cache-aria2
+        uses: actions/cache@v4
+        with:
+          path: /tmp/aria2-bin
+          key: aria2-${{ runner.os }}-v1.37.0
+
+      - name: Install aria2 (if not cached)
+        if: ${{ steps.cache-aria2.outputs.cache-hit != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo sh -c 'echo "nameserver 8.8.8.8" > /etc/resolv.conf'
+          sudo sh -c 'echo "nameserver 8.8.4.4" >> /etc/resolv.conf'
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2
+          mkdir -p /tmp/aria2-bin
+          cp /usr/bin/aria2c /tmp/aria2-bin/
+          echo "✅ aria2 installed and copied to cache path."
+
+      - name: Verify aria2
+        shell: bash
+        run: |
+          if [ -f /tmp/aria2-bin/aria2c ]; then
+            /tmp/aria2-bin/aria2c --version | head -n 1
+          else
+            aria2c --version | head -n 1
+          fi
