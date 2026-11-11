@@ -96,11 +96,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade yt-dlp
           pip install "curl_cffi>=0.10,<0.16"
-
-          echo "--- yt-dlp version ---"
           yt-dlp --version
-          echo "--- Impersonation targets ---"
-          yt-dlp --list-impersonate-targets
+          yt-dlp --list-impersonate-targets || true
 
       - name: Verify FFmpeg codecs
         shell: bash
@@ -122,67 +119,72 @@ jobs:
           sudo apt-get install -y -qq aria2
           aria2c --version | head -n 1
 
-      - name: List Formats (with filesize approximation for HLS)
+      - name: List Formats (using --print for accurate HLS size)
         if: ${{ github.event.inputs.format_id == '' }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "🔍 Fetching info with impersonation and filesize approximation..."
-          if yt-dlp -J --no-playlist \
+          URL="${{ github.event.inputs.video_url }}"
+          echo "🔍 Fetching format info with filesize approximation via --print..."
+
+          # استفاده از --print به جای -J: چون --print از مسیر format selection
+          # رد می‌شود و مقدار filesize_approx محاسبه‌شده را برمی‌گرداند
+          if ! yt-dlp --skip-download --no-warnings \
             --impersonate "chrome" \
             --extractor-retries 3 \
             --compat-option manifest-filesize-approx \
-            "${{ github.event.inputs.video_url }}" > info.json 2> err.log; then
-
-            echo "✅ Successfully fetched info."
-            TITLE=$(jq -r '.title // "unknown"' info.json)
-            DURATION=$(jq -r '.duration // 0' info.json)
-            echo "## 📋 $TITLE" >> $GITHUB_STEP_SUMMARY
-            echo "**مدت:** ${DURATION}s" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "| Format ID | Ext | Resolution | VCodec | Size (MB) |" >> $GITHUB_STEP_SUMMARY
-            echo "|-----------|-----|------------|--------|-----------|" >> $GITHUB_STEP_SUMMARY
-
-            # فرمت‌بندی حجم: اگر 0 بود، "?" نمایش داده می‌شود
-            jq -r '
-              .formats[]
-              | select(.vcodec != "none" and .vcodec != null)
-              | [
-                  (.format_id // "-"),
-                  (.ext // "-"),
-                  (.resolution // "-"),
-                  ((.vcodec // "") | split(".")[0]),
-                  (
-                    ((.filesize // .filesize_approx // 0) / 1048576)
-                    | floor
-                    | if . == 0 then "?" else tostring end
-                  )
-                ]
-              | "| " + join(" | ") + " |"
-            ' info.json >> $GITHUB_STEP_SUMMARY
-
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "💡 **نکته:** علامت «?» یعنی حجم هنوز از سمت سایت اعلام نشده." >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-
-            # جدول جایگزین با خروجی yt-dlp -F (گاهی حجم دقیق‌تری نشان می‌دهد)
-            echo "### 📊 جدول دقیق‌تر (yt-dlp -F)" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            yt-dlp -F \
-              --impersonate "chrome" \
-              --extractor-retries 3 \
-              --compat-option manifest-filesize-approx \
-              "${{ github.event.inputs.video_url }}" >> $GITHUB_STEP_SUMMARY 2>&1 || true
-            echo '```' >> $GITHUB_STEP_SUMMARY
-
-          else
-            echo "❌ Failed to fetch info even with impersonation."
-            echo "--- Error Log ---"
+            --print "TITLE|%(title)s" \
+            --print "DURATION|%(duration)s" \
+            --print "FMT|%(format_id)s|%(ext)s|%(resolution)s|%(vcodec)s|%(filesize_approx)s|%(filesize)s" \
+            "$URL" > /tmp/all.txt 2>err.log; then
+            echo "❌ Extraction failed:"
             cat err.log
             echo "### ⚠️ Diagnostic Failed" >> $GITHUB_STEP_SUMMARY
-            echo "Could not retrieve video info. The site likely requires **cookies** or is blocking the GitHub Actions IP." >> $GITHUB_STEP_SUMMARY
+            echo "Site likely requires **cookies** or is blocking GitHub IP." >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
+
+          echo "--- Raw output (debug) ---"
+          head -20 /tmp/all.txt
+
+          # استخراج عنوان و مدت
+          TITLE=$(grep -m1 '^TITLE|' /tmp/all.txt | sed 's/^TITLE|//' || true)
+          DURATION=$(grep -m1 '^DURATION|' /tmp/all.txt | sed 's/^DURATION|//' || true)
+          [ -z "$TITLE" ] && TITLE="(unknown)"
+          [ -z "$DURATION" ] && DURATION="?"
+
+          echo "## 📋 $TITLE" >> $GITHUB_STEP_SUMMARY
+          echo "**مدت:** ${DURATION}s" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Format ID | Ext | Resolution | VCodec | Size (MB) |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-----|------------|--------|-----------|" >> $GITHUB_STEP_SUMMARY
+
+          while IFS='|' read -r TAG FID EXT RES VC FS_A FS_E; do
+            [ "$TAG" != "FMT" ] && continue
+            [ -z "$FID" ] && continue
+            [ "$VC" = "none" ] && continue
+
+            # اولویت با filesize_approx (دقیق‌تر برای HLS)
+            SIZE="$FS_A"
+            if [ -z "$SIZE" ] || [ "$SIZE" = "None" ] || [ "$SIZE" = "NA" ] || [ "$SIZE" = "null" ]; then
+              SIZE="$FS_E"
+            fi
+
+            if [ -z "$SIZE" ] || [ "$SIZE" = "None" ] || [ "$SIZE" = "NA" ] || [ "$SIZE" = "null" ]; then
+              MB="?"
+            else
+              MB=$(awk -v s="$SIZE" 'BEGIN { printf "%.1f", s/1048576 }')
+            fi
+
+            VC_CLEAN="${VC%%.*}"
+            if [ -z "$VC_CLEAN" ] || [ "$VC_CLEAN" = "None" ]; then VC_CLEAN="-"; fi
+            if [ -z "$RES" ] || [ "$RES" = "None" ]; then RES="-"; fi
+
+            echo "| $FID | $EXT | $RES | $VC_CLEAN | $MB |" >> $GITHUB_STEP_SUMMARY
+          done < /tmp/all.txt
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "💡 شناسه فرمت را کپی کنید و ورک‌فلو را دوباره با format_id اجرا کنید." >> $GITHUB_STEP_SUMMARY
 
       - name: Download (with fallback methods)
         if: ${{ github.event.inputs.format_id != '' }}
@@ -264,7 +266,6 @@ jobs:
 
           if [ "$ACODEC" = "libopus" ]; then
             OUT_EXT="mkv"
-            echo "ℹ️ audio_codec=libopus → خروجی .mkv"
           else
             OUT_EXT="mp4"
           fi
@@ -312,7 +313,6 @@ jobs:
             echo "📦 بسته‌بندی با 7z..."
             7z a -t7z -mx=9 -mfb=273 -ms=on artifact/video.7z output/*
           else
-            echo "📁 ارسال مستقیم"
             find output -maxdepth 1 -type f -exec cp {} artifact/ \;
           fi
           ls -lh artifact/
