@@ -357,7 +357,6 @@ jobs:
             case "$VCODEC" in
               libx264|libx265) PRESET="veryslow" ;;
               libsvtav1)
-                # اگر max_compression فعاله، preset 0 بمونه؛ وگرنه 6
                 if [ "${{ github.event.inputs.max_compression }}" = "true" ]; then
                   SVT_PRESET=0
                 else
@@ -377,7 +376,15 @@ jobs:
           OUT_FILE="output/${BASENAME}_optimized.${OUT_EXT}"
 
           # ============================================================
-          # آرگومان‌های ویدیو + pix_fmt مخصوص هر کدک
+          # گزینه‌های ورودی (فقط قبل از -i)
+          # -fflags +genpts             → تولید PTS برای فریم‌های بدون تایم‌استمپ
+          # -avoid_negative_ts make_zero → شروع از صفر
+          # ============================================================
+          INPUT_FIX=(-fflags +genpts -avoid_negative_ts make_zero)
+
+          # ============================================================
+          # گزینه‌های ویدیو (خروجی)
+          # -fps_mode cfr → جایگزین مدرن -vsync (گزینه‌ی خروجی است)
           # ============================================================
           VPARAMS=(-c:v "$VCODEC")
           case "$VCODEC" in
@@ -388,17 +395,10 @@ jobs:
               VPARAMS+=(-preset "$SVT_PRESET" -crf "$CRF" -pix_fmt yuv420p10le)
               ;;
           esac
+          VPARAMS+=(-fps_mode cfr)
 
           # ============================================================
-          # فلگ‌های تایم‌استمپ (بدون تداخل و بدون منسوخ‌شدگی)
-          # -fflags +genpts             → تولید PTS برای فریم‌های بدون تایم‌استمپ
-          # -avoid_negative_ts make_zero → شروع از صفر
-          # -fps_mode cfr               → جایگزین مدرن -vsync (که منسوخ شده)
-          # ============================================================
-          INPUT_FIX=(-fflags +genpts -avoid_negative_ts make_zero -fps_mode cfr)
-
-          # ============================================================
-          # faststart فقط برای MP4 (روی MKV بی‌فایده و خطرناکه)
+          # faststart فقط برای MP4
           # ============================================================
           MOVFLAGS=()
           if [ "$OUT_EXT" = "mp4" ]; then
@@ -406,11 +406,9 @@ jobs:
           fi
 
           # ============================================================
-          # اجرا با پیشرفت و ضدگیر
-          # -stats                    → نمایش frame=/fps=/time=
-          # -max_muxing_queue_size    → جلوگیری از توقف در انتظار پکت
+          # اجرا
           # ============================================================
-          echo "🎬 ffmpeg ${VPARAMS[*]} -c:a $ACODEC -b:a $ABITRATE → $OUT_FILE"
+          echo "🎬 ffmpeg ${INPUT_FIX[*]} -i \"$INPUT\" ${VPARAMS[*]} -c:a $ACODEC -b:a $ABITRATE ${MOVFLAGS[*]} \"$OUT_FILE\""
           echo "⏱️ ممکن است ساعت‌ها طول بکشد (بسته به preset و طول ویدیو)"
 
           ffmpeg -y -hide_banner -stats \
