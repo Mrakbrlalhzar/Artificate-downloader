@@ -3,59 +3,95 @@ name: Ultimate Video Downloader (Cached Tools)
 on:
   workflow_dispatch:
     inputs:
+      # ============================================================
+      # ۱) ورودی‌های پایه — همیشه لازم
+      # ============================================================
       video_url:
-        description: 'لینک ویدیو'
+        description: '🔗 لینک ویدیو — آدرس کامل صفحه ویدیو رو اینجا بذار (مثلاً https://example.com/video?id=123)'
         required: true
         type: string
+
       format_id:
-        description: 'شناسه فرمت (خالی = فقط لیست کیفیت‌ها)'
+        description: '🎯 شناسه کیفیت — اگر خالی بذاری، لیست کیفیت‌های موجود نمایش داده می‌شه. بعد از دیدن لیست، مثلاً hls-2920 یا 1080p رو وارد کن.'
         required: false
         type: string
+
       compress:
-        description: 'فشرده‌سازی با FFmpeg؟'
+        description: '🗜️ فشرده‌سازی — آیا بعد از دانلود، فایل با FFmpeg فشرده بشه؟ (تیک = بله، بدون تیک = فایل اصلی ذخیره می‌شه)'
         required: true
         type: boolean
         default: true
-      aggressive_compression:
-        description: 'حالت تهاجمی (CRF بالاتر، پریست کندتر)'
-        required: true
-        type: boolean
-        default: false
+
+      # ============================================================
+      # ۲) تنظیمات فشرده‌سازی — فقط وقتی compress فعال باشد
+      # ============================================================
       video_codec:
-        description: 'کدک ویدیو'
+        description: '🎬 کدک ویدیو — libx264 (سازگارترین)، libx265 (حجم ۲۵٪ کمتر، کمی کندتر)، libsvtav1 (کمترین حجم ولی کندتر و فقط روی سیستم‌های جدید پخش می‌شه)'
         required: true
         type: choice
         default: 'libx264'
-        options: [libx264, libx265, libsvtav1]
+        options:
+          - libx264     # H.264 — همه‌جا پخش می‌شه، حجم متعادل
+          - libx265     # H.265 — ۲۵-۳۰٪ کوچک‌تر از H.264، کندتر
+          - libsvtav1   # AV1 — کمترین حجم، ولی کندترین
+
       crf:
-        description: 'CRF (x264/x265=0-51، SVT-AV1=0-63)'
+        description: '🎚️ کیفیت (CRF) — عدد کمتر = کیفیت بالاتر و حجم بیشتر | برای x264/x265: 0 تا 51 (پیشنهاد 23) | برای AV1: 0 تا 63 (پیشنهاد 30)'
         required: true
         type: number
         default: 23
+
       preset:
-        description: 'پریست (x264/x265)'
+        description: '⚡ پریست (فقط برای x264/x265) — ultrafast = سریع‌ترین، veryslow = کندترین ولی بهترین فشرده‌سازی. پیشنهاد: medium یا slow'
         required: false
         type: choice
         default: 'medium'
-        options: [ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow]
+        options:
+          - ultrafast
+          - superfast
+          - veryfast
+          - faster
+          - fast
+          - medium
+          - slow
+          - slower
+          - veryslow
+
       svtav1_preset:
-        description: 'SVT-AV1 preset (0-13. بالاتر = سریع‌تر)'
+        description: '⚡ پریست AV1 (فقط برای libsvtav1) — 0 = کندترین و بهترین فشرده‌سازی، 13 = سریع‌ترین. پیشنهاد: 8 (سرعت و کیفیت متعادل)'
         required: false
         type: number
         default: 8
+
+      aggressive_compression:
+        description: '🔥 حالت تهاجمی — CRF رو ۶ واحد بالا می‌بره و پریست رو کندتر می‌کنه تا حجم بیشتر کم بشه (کیفیت کمی پایین‌تر). فقط وقتی compress فعال باشه کار می‌کنه.'
+        required: true
+        type: boolean
+        default: false
+
+      # ============================================================
+      # ۳) تنظیمات صدا
+      # ============================================================
       audio_codec:
-        description: 'کدک صدا'
+        description: '🔊 کدک صدا — aac (سازگارترین)، libopus (حجم کمتر با کیفیت مشابه). توجه: libopus خروجی رو به MKV تبدیل می‌کنه.'
         required: true
         type: choice
         default: 'aac'
-        options: [aac, libopus]
+        options:
+          - aac         # استاندارد، همه‌جا پخش می‌شه
+          - libopus     # حجم کمتر، کیفیت بهتر در بیت‌ریت پایین
+
       audio_bitrate:
-        description: 'بیتریت صدا'
+        description: '🎵 بیتریت صدا — 128k استاندارد، 96k حجم کمتر، 192k کیفیت بالاتر. (مثلاً 128k)'
         required: false
         type: string
         default: '128k'
+
+      # ============================================================
+      # ۴) بسته‌بندی خروجی
+      # ============================================================
       package_as_7z:
-        description: 'بسته‌بندی با 7z (تأثیر کم روی MP4)'
+        description: '📦 بسته‌بندی با 7z — فایل نهایی رو داخل یه آرشیو 7z فشرده قرار می‌ده. توجه: روی MP4 تأثیر کمی داره (زیر ۵٪). فقط اگه می‌خوای چند فایل رو یکجا داشته باشی مفیده.'
         required: true
         type: boolean
         default: false
@@ -101,7 +137,6 @@ jobs:
             echo "❌ yt-dlp cache not found! Run the 'Setup Build Cache' workflow first."
             exit 1
           fi
-          yt-dlp --version
 
       - name: Restore cached aria2
         uses: actions/cache@v4
@@ -118,7 +153,6 @@ jobs:
           else
             sudo apt-get update -qq && sudo apt-get install -y -qq aria2
           fi
-          aria2c --version | head -n 1
 
       # ============================================================
       # تأیید ابزارها و اعتبارسنجی ورودی‌ها
@@ -163,7 +197,7 @@ jobs:
         run: |
           set -euo pipefail
           URL="${{ github.event.inputs.video_url }}"
-          echo "🔍 Fetching format table via -F..."
+          echo "🔍 در حال دریافت لیست کیفیت‌ها..."
 
           if ! yt-dlp -F \
             --impersonate "chrome" \
@@ -223,7 +257,7 @@ jobs:
           ' /tmp/formats.txt >> $GITHUB_STEP_SUMMARY
 
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "💡 شناسه فرمت را کپی کنید و ورک‌فلو را دوباره با format_id اجرا کنید." >> $GITHUB_STEP_SUMMARY
+          echo "💡 **قدم بعدی:** شناسه فرمت دلخواه را کپی کن، فیلد `format_id` را با آن پر کن و دوباره اجرا کن." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "<details><summary>🔍 خروجی خام -F (برای دیباگ)</summary>" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -246,7 +280,7 @@ jobs:
           FORMAT_SPEC="${FORMAT_ID}+ba/${FORMAT_ID}/bv*+ba/b"
           echo "📥 Format spec: $FORMAT_SPEC"
 
-          echo "📥 Method 1: Chrome impersonation..."
+          echo "📥 روش ۱: جعل هویت Chrome..."
           if yt-dlp --no-playlist \
             --no-write-subs --no-write-auto-subs --no-write-thumbnail \
             --no-part \
@@ -256,9 +290,9 @@ jobs:
             -f "$FORMAT_SPEC" \
             --output "original/%(title).200B.%(ext)s" \
             "$URL"; then
-            echo "✅ Download succeeded with Method 1."
+            echo "✅ دانلود با روش ۱ موفق بود."
           else
-            echo "⚠️ Method 1 failed. Trying Method 2 (Safari impersonation)..."
+            echo "⚠️ روش ۱ شکست خورد. تلاش با روش ۲ (Safari)..."
             yt-dlp --no-playlist \
               --no-write-subs --no-write-auto-subs --no-write-thumbnail \
               --no-part \
@@ -272,7 +306,7 @@ jobs:
           ls -lh original/
 
       # ============================================================
-      # فشرده‌سازی با FFmpeg
+      # فشرده‌سازی با FFmpeg (با pix_fmt مناسب هر کدک)
       # ============================================================
       - name: Compress
         if: ${{ github.event.inputs.format_id != '' && github.event.inputs.compress == 'true' }}
@@ -300,7 +334,7 @@ jobs:
           esac
 
           if [ "${{ github.event.inputs.aggressive_compression }}" = "true" ]; then
-            echo "⚡ حالت تهاجمی فعال"
+            echo "⚡ حالت تهاجمی فعال — CRF +۶، پریست کندتر، صدای 96k"
             CRF=$((CRF + 6))
             case "$VCODEC" in
               libx264|libx265) PRESET="veryslow" ;;
@@ -317,10 +351,16 @@ jobs:
           if [ "$ACODEC" = "libopus" ]; then OUT_EXT="mkv"; else OUT_EXT="mp4"; fi
           OUT_FILE="output/${BASENAME}_optimized.${OUT_EXT}"
 
+          # --- تنظیم pix_fmt مناسب هر کدک ---
           VPARAMS=(-c:v "$VCODEC")
           case "$VCODEC" in
-            libx264|libx265) VPARAMS+=(-preset "$PRESET" -crf "$CRF") ;;
-            libsvtav1) VPARAMS+=(-preset "$SVT_PRESET" -crf "$CRF") ;;
+            libx264|libx265)
+              VPARAMS+=(-preset "$PRESET" -crf "$CRF" -pix_fmt yuv420p)
+              ;;
+            libsvtav1)
+              # ⚠️ SVT-AV1-Essential فقط از 10-bit پشتیبانی می‌کند
+              VPARAMS+=(-preset "$SVT_PRESET" -crf "$CRF" -pix_fmt yuv420p10le)
+              ;;
           esac
 
           echo "🎬 ffmpeg ${VPARAMS[*]} -c:a $ACODEC -b:a $ABITRATE"
@@ -329,7 +369,11 @@ jobs:
             -movflags +faststart "$OUT_FILE"
 
           IN_SIZE=$(stat -c%s "$INPUT"); OUT_SIZE=$(stat -c%s "$OUT_FILE")
-          echo "📊 اصلی: $IN_SIZE بایت | فشرده: $OUT_SIZE بایت"
+          IN_MB=$(awk -v s="$IN_SIZE" 'BEGIN {printf "%.1f", s/1048576}')
+          OUT_MB=$(awk -v s="$OUT_SIZE" 'BEGIN {printf "%.1f", s/1048576}')
+          SAVE_PCT=$(awk -v i="$IN_SIZE" -v o="$OUT_SIZE" 'BEGIN {printf "%.0f", (1 - o/i) * 100}')
+          echo "📊 حجم اصلی: ${IN_MB}MB | حجم فشرده: ${OUT_MB}MB | کاهش: ${SAVE_PCT}%"
+
           if [ "$OUT_SIZE" -ge "$IN_SIZE" ]; then
             echo "⚠️ فشرده‌سازی حجم را کم نکرد؛ نسخه‌ی اصلی حفظ می‌شود."
             cp "$INPUT" "output/$(basename "$INPUT")"
@@ -362,10 +406,10 @@ jobs:
 
           if [ "${{ github.event.inputs.package_as_7z }}" = "true" ]; then
             command -v 7z &>/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full; }
-            echo "📦 بسته‌بندی با 7z..."
+            echo "📦 بسته‌بندی با 7z (حالت max)..."
             7z a -t7z -mx=9 -mfb=273 -ms=on artifact/video.7z output/*
           else
-            echo "📁 ارسال مستقیم"
+            echo "📁 ارسال مستقیم (بدون آرشیو اضافی)"
             find output -maxdepth 1 -type f -exec cp {} artifact/ \;
           fi
           ls -lh artifact/
